@@ -1,0 +1,155 @@
+name: 'Docker Compose Deploy'
+description: 'Deploy application from container registry using docker compose'
+
+inputs:
+  registry:
+    description: 'Container registry URL (e.g., ghcr.io, docker.io)'
+    required: true
+  username:
+    description: 'Registry username'
+    required: true
+  password:
+    description: 'Registry password or token'
+    required: true
+  compose-file:
+    description: 'Path to docker-compose file'
+    required: false
+    default: 'docker-compose.yml'
+  project-name:
+    description: 'Docker Compose project name'
+    required: false
+    default: ''
+  env-file:
+    description: 'Path to environment file for docker compose'
+    required: false
+    default: ''
+  services:
+    description: 'Specific services to deploy (space-separated). Leave empty to deploy all services.'
+    required: false
+    default: ''
+  pull:
+    description: 'Pull images before starting containers'
+    required: false
+    default: 'true'
+  remove-orphans:
+    description: 'Remove containers for services not defined in the compose file'
+    required: false
+    default: 'true'
+  force-recreate:
+    description: 'Force recreation of containers'
+    required: false
+    default: 'false'
+  build:
+    description: 'Build images before starting containers'
+    required: false
+    default: 'false'
+
+outputs:
+  deployed-services:
+    description: 'List of deployed services'
+    value: ${{ steps.deploy.outputs.services }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Log in to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ inputs.registry }}
+        username: ${{ inputs.username }}
+        password: ${{ inputs.password }}
+
+    - name: Pull images
+      if: ${{ inputs.pull == 'true' }}
+      shell: bash
+      env:
+        COMPOSE_FILE: ${{ inputs.compose-file }}
+        PROJECT_NAME: ${{ inputs.project-name }}
+        ENV_FILE: ${{ inputs.env-file }}
+        SERVICES: ${{ inputs.services }}
+      run: |
+        COMPOSE_CMD="docker compose"
+        
+        if [ -n "$COMPOSE_FILE" ]; then
+          COMPOSE_CMD="$COMPOSE_CMD -f $COMPOSE_FILE"
+        fi
+        
+        if [ -n "$PROJECT_NAME" ]; then
+          COMPOSE_CMD="$COMPOSE_CMD -p $PROJECT_NAME"
+        fi
+        
+        if [ -n "$ENV_FILE" ]; then
+          COMPOSE_CMD="$COMPOSE_CMD --env-file $ENV_FILE"
+        fi
+        
+        $COMPOSE_CMD pull $SERVICES
+
+    - name: Deploy with Docker Compose
+      id: deploy
+      shell: bash
+      env:
+        COMPOSE_FILE: ${{ inputs.compose-file }}
+        PROJECT_NAME: ${{ inputs.project-name }}
+        ENV_FILE: ${{ inputs.env-file }}
+        SERVICES: ${{ inputs.services }}
+        REMOVE_ORPHANS: ${{ inputs.remove-orphans }}
+        FORCE_RECREATE: ${{ inputs.force-recreate }}
+        BUILD: ${{ inputs.build }}
+      run: |
+        COMPOSE_CMD="docker compose"
+        
+        if [ -n "$COMPOSE_FILE" ]; then
+          COMPOSE_CMD="$COMPOSE_CMD -f $COMPOSE_FILE"
+        fi
+        
+        if [ -n "$PROJECT_NAME" ]; then
+          COMPOSE_CMD="$COMPOSE_CMD -p $PROJECT_NAME"
+        fi
+        
+        if [ -n "$ENV_FILE" ]; then
+          COMPOSE_CMD="$COMPOSE_CMD --env-file $ENV_FILE"
+        fi
+        
+        UP_ARGS="-d"
+        
+        if [ "$REMOVE_ORPHANS" == "true" ]; then
+          UP_ARGS="$UP_ARGS --remove-orphans"
+        fi
+        
+        if [ "$FORCE_RECREATE" == "true" ]; then
+          UP_ARGS="$UP_ARGS --force-recreate"
+        fi
+        
+        if [ "$BUILD" == "true" ]; then
+          UP_ARGS="$UP_ARGS --build"
+        fi
+        
+        $COMPOSE_CMD up $UP_ARGS $SERVICES
+        
+        # Get list of deployed services
+        DEPLOYED_SERVICES=$($COMPOSE_CMD ps --services 2>/dev/null | tr '\n' ' ' || echo "")
+        echo "services=$DEPLOYED_SERVICES" >> $GITHUB_OUTPUT
+
+    - name: Show deployment status
+      shell: bash
+      env:
+        COMPOSE_FILE: ${{ inputs.compose-file }}
+        PROJECT_NAME: ${{ inputs.project-name }}
+        ENV_FILE: ${{ inputs.env-file }}
+      run: |
+        COMPOSE_CMD="docker compose"
+        
+        if [ -n "$COMPOSE_FILE" ]; then
+          COMPOSE_CMD="$COMPOSE_CMD -f $COMPOSE_FILE"
+        fi
+        
+        if [ -n "$PROJECT_NAME" ]; then
+          COMPOSE_CMD="$COMPOSE_CMD -p $PROJECT_NAME"
+        fi
+        
+        if [ -n "$ENV_FILE" ]; then
+          COMPOSE_CMD="$COMPOSE_CMD --env-file $ENV_FILE"
+        fi
+        
+        echo "=== Deployed Containers ==="
+        $COMPOSE_CMD ps
