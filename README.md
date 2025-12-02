@@ -1,112 +1,11 @@
 # Shared GitHub Actions
 
-A collection of reusable GitHub Actions for Docker-based CI/CD workflows.
+Reusable GitHub Actions and Workflows for Docker-based CI/CD pipelines.
 
-## Available Actions
-
-### Docker Build and Push
-
-Build and push Docker images to a container registry.
-
-**Location:** `docker-build-push`
-
-#### Inputs
-
-| Input | Description | Required | Default |
-|-------|-------------|----------|---------|
-| `registry` | Container registry URL (e.g., ghcr.io, docker.io) | Yes | - |
-| `username` | Registry username | Yes | - |
-| `password` | Registry password or token | Yes | - |
-| `image-name` | Docker image name (without registry prefix) | Yes | - |
-| `tag` | Docker image tag | No | `latest` |
-| `context` | Build context path | No | `.` |
-| `dockerfile` | Path to Dockerfile | No | `Dockerfile` |
-| `build-args` | Build arguments (one per line, KEY=VALUE format) | No | - |
-| `push` | Push the image to registry | No | `true` |
-
-#### Outputs
-
-| Output | Description |
-|--------|-------------|
-| `image` | Full image reference (registry/image:tag) |
-| `digest` | Image digest |
-
-#### Example Usage
+## Quick Start
 
 ```yaml
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Build and Push Docker Image
-        uses: ShellyNAS/shared-actions/docker-build-push@main
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-          image-name: ${{ github.repository }}
-          tag: ${{ github.sha }}
-```
-
----
-
-### Docker Compose Deploy
-
-Deploy applications from a container registry using docker compose.
-
-**Location:** `docker-compose-deploy`
-
-#### Inputs
-
-| Input | Description | Required | Default |
-|-------|-------------|----------|---------|
-| `registry` | Container registry URL (e.g., ghcr.io, docker.io) | Yes | - |
-| `username` | Registry username | Yes | - |
-| `password` | Registry password or token | Yes | - |
-| `compose-file` | Path to docker-compose file | No | `docker-compose.yml` |
-| `project-name` | Docker Compose project name | No | - |
-| `env-file` | Path to environment file for docker compose | No | - |
-| `services` | Specific services to deploy (space-separated) | No | all services |
-| `pull` | Pull images before starting containers | No | `true` |
-| `remove-orphans` | Remove containers for services not defined in the compose file | No | `true` |
-| `force-recreate` | Force recreation of containers | No | `false` |
-| `build` | Build images before starting containers | No | `false` |
-
-#### Outputs
-
-| Output | Description |
-|--------|-------------|
-| `deployed-services` | List of deployed services |
-
-#### Example Usage
-
-```yaml
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Deploy with Docker Compose
-        uses: ShellyNAS/shared-actions/docker-compose-deploy@main
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-          compose-file: docker-compose.yml
-          project-name: my-app
-```
-
----
-
-## Complete CI/CD Example
-
-Here's an example of using both actions together in a workflow:
-
-```yaml
-name: Build and Deploy
+name: Build & Deploy
 
 on:
   push:
@@ -114,38 +13,59 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
-    outputs:
-      image: ${{ steps.build.outputs.image }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Build and Push
-        id: build
-        uses: ShellyNAS/shared-actions/docker-build-push@main
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-          image-name: ${{ github.repository }}
-          tag: ${{ github.sha }}
+    uses: shelly-nas/shared-actions/.github/workflows/build-push.yml@main
+    with:
+      registry: ${{ vars.REGISTRY_URL }}
+      images: '[{"name": "my-app", "context": "."}]'
+    secrets:
+      registry-username: ${{ vars.REGISTRY_USERNAME }}
+      registry-password: ${{ secrets.REGISTRY_PASSWORD }}
 
   deploy:
-    runs-on: self-hosted
     needs: build
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Deploy
-        uses: ShellyNAS/shared-actions/docker-compose-deploy@main
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-          compose-file: docker-compose.prod.yml
-          project-name: my-application
+    uses: shelly-nas/shared-actions/.github/workflows/deploy.yml@main
+    with:
+      registry: ${{ vars.REGISTRY_URL }}
+      deploy-directory: /opt/my-app
+      env-variables: |
+        DB_HOST=localhost
+        API_KEY=${{ secrets.API_KEY }}
+    secrets:
+      registry-username: ${{ vars.REGISTRY_USERNAME }}
+      registry-password: ${{ secrets.REGISTRY_PASSWORD }}
 ```
 
-## License
+## Workflows
 
-MIT
+| Workflow | Description |
+| -------- | ----------- |
+| `build-push.yml` | Build and push Docker images in parallel |
+| `deploy.yml` | Deploy with docker-compose, health checks, and cleanup |
+
+## Actions
+
+| Action | Description |
+| ------ | ----------- |
+| `docker-build-push` | Build and push Docker image |
+| `docker-login` / `docker-logout` | Registry authentication |
+| `docker-compose-deploy` | Deploy using docker-compose |
+| `docker-compose-stop` | Stop containers |
+| `docker-compose-pull` | Pull images |
+| `docker-compose-health-check` | Verify services are healthy |
+| `docker-cleanup` | Clean up Docker resources |
+| `create-env-file` | Create .env files |
+| `prepare-deploy-directory` | Prepare deployment directory |
+| `set-image-tag` | Determine image tag (sha/branch/semver) |
+
+## Using Actions Directly
+
+```yaml
+steps:
+  - uses: actions/checkout@v4
+  - uses: shelly-nas/shared-actions/docker-build-push@main
+    with:
+      registry: ghcr.io
+      username: ${{ github.actor }}
+      password: ${{ secrets.GITHUB_TOKEN }}
+      image-name: my-app
+```

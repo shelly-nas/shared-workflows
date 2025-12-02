@@ -1,0 +1,63 @@
+name: 'Prepare Deploy Directory'
+description: 'Create deployment directory and copy necessary files'
+
+inputs:
+  deploy-directory:
+    description: 'Target deployment directory path'
+    required: true
+  source-files:
+    description: 'Files to copy (format: source:destination per line)'
+    required: false
+    default: ''
+  clean-directory:
+    description: 'Clean directory before copying'
+    required: false
+    default: 'false'
+
+outputs:
+  directory:
+    description: 'The deployment directory path'
+    value: ${{ inputs.deploy-directory }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Prepare directory
+      shell: bash
+      run: |
+        DIR="${{ inputs.deploy-directory }}"
+        
+        if [ ! -d "$DIR" ]; then
+          mkdir -p "$DIR"
+          echo "::notice title=Created::Directory $DIR"
+        elif [ "${{ inputs.clean-directory }}" == "true" ]; then
+          rm -rf "${DIR:?}"/*
+          echo "::notice title=Cleaned::Directory $DIR"
+        fi
+
+    - name: Copy files
+      shell: bash
+      run: |
+        DIR="${{ inputs.deploy-directory }}"
+        FILES='${{ inputs.source-files }}'
+        
+        [ -z "$FILES" ] && exit 0
+        
+        echo "$FILES" | while IFS= read -r line; do
+          [ -z "$line" ] && continue
+          
+          if echo "$line" | grep -q ':'; then
+            SRC=$(echo "$line" | cut -d':' -f1)
+            DST=$(echo "$line" | cut -d':' -f2)
+          else
+            SRC="$line"
+            DST=$(basename "$SRC")
+          fi
+          
+          if [ -e "$SRC" ]; then
+            cp -r "$SRC" "$DIR/$DST"
+            echo "::notice title=Copied::$SRC → $DIR/$DST"
+          else
+            echo "::warning title=Not Found::$SRC"
+          fi
+        done

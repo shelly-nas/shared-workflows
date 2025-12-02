@@ -1,0 +1,43 @@
+name: 'Docker Compose Stop'
+description: 'Stop and optionally remove Docker Compose containers'
+
+inputs:
+  working-directory:
+    description: 'Working directory containing docker-compose file'
+    required: false
+    default: '.'
+  compose-file:
+    description: 'Path to docker-compose file'
+    required: false
+    default: 'docker-compose.yml'
+  project-name:
+    description: 'Docker Compose project name'
+    required: false
+    default: ''
+  remove-volumes:
+    description: 'Remove named volumes'
+    required: false
+    default: 'false'
+  timeout:
+    description: 'Timeout in seconds'
+    required: false
+    default: '10'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Stop Docker Compose containers
+      id: stop
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      continue-on-error: true
+      run: |
+        ARGS="-f ${{ inputs.compose-file }} down --timeout ${{ inputs.timeout }} --remove-orphans"
+        [ -n "${{ inputs.project-name }}" ] && ARGS="-p ${{ inputs.project-name }} $ARGS"
+        [ "${{ inputs.remove-volumes }}" == "true" ] && ARGS="$ARGS --volumes"
+        
+        if docker compose $ARGS; then
+          echo "::notice title=Stopped::Containers stopped successfully"
+        else
+          echo "::warning title=Stop Failed::No containers to stop or stop failed"
+        fi
