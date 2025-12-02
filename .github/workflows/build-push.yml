@@ -2,6 +2,7 @@
 
 name: Build & Push
 
+
 on:
   workflow_call:
     inputs:
@@ -9,31 +10,58 @@ on:
         description: 'Container registry URL'
         required: true
         type: string
-      images:
-        description: 'JSON array of images to build [{name, context}]'
+      image_tag:
+        description: 'Full image tag (registry/image:tag)'
         required: true
         type: string
-    secrets:
-      registry-username:
-        description: 'Registry username'
+      context:
+        description: 'Build context directory'
         required: true
-      registry-password:
+        type: string
+      runner:
+        description: 'GitHub runner to use'
+        required: false
+        type: string
+        default: 'shelly'
+    secrets:
+      registry_password:
         description: 'Registry password'
         required: true
 
 jobs:
-  build:
-    name: Build ${{ matrix.image.name }}
-    runs-on: shelly
-    strategy:
-      matrix:
-        image: ${{ fromJson(inputs.images) }}
+  build-and-push:
+    name: Build and Push Docker Image
+    runs-on: ${{ inputs.runner }}
+    
     steps:
-      - uses: actions/checkout@v4
-      - uses: shelly-nas/shared-actions/docker-build-push@main
-        with:
-          registry: ${{ inputs.registry }}
-          username: ${{ secrets.registry-username }}
-          password: ${{ secrets.registry-password }}
-          image-name: ${{ matrix.image.name }}
-          context: ${{ matrix.image.context }}
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Log in to Registry
+        run: |
+          echo "${{ secrets.registry_password }}" | docker login ${{ inputs.registry }} \
+            --username "${{ vars.REGISTRY_USERNAME }}" \
+            --password-stdin
+      
+      - name: Clean up old images
+        run: |
+          docker image prune -af || true
+      
+      - name: Build Docker image
+        working-directory: ${{ inputs.context }}
+        run: |
+          docker build \
+            --tag ${{ inputs.image_tag }} \
+            --file Dockerfile \
+            .
+      
+      - name: Push Docker image
+        run: docker push ${{ inputs.image_tag }}
+      
+      - name: Remove local image
+        if: always()
+        run: docker image rm -f ${{ inputs.image_tag }} || true
+      
+      - name: Log out from Registry
+        if: always()
+        run: docker logout ${{ inputs.registry }}

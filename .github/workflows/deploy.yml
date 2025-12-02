@@ -1,4 +1,5 @@
 # Reusable Deploy Workflow
+# Deploys containers using docker compose with registry authentication
 
 name: Deploy
 
@@ -9,71 +10,139 @@ on:
         description: 'Container registry URL'
         required: true
         type: string
-      deploy-directory:
+      deploy_directory:
         description: 'Deployment directory on the runner'
         required: true
         type: string
-      compose-source:
-        description: 'Source compose file (renamed to docker-compose.yaml)'
+      compose_file:
+        description: 'Source compose file to deploy (will be copied to deploy directory as docker-compose.yaml)'
         required: false
         type: string
         default: 'docker-compose.prod.yaml'
+      image_tag:
+        description: 'Image tag to deploy'
+        required: false
+        type: string
+        default: 'latest'
+      runner:
+        description: 'Runner to use for deployment'
+        required: false
+        type: string
+        default: 'shelly'
+      health_check_delay:
+        description: 'Seconds to wait before health check'
+        required: false
+        type: number
+        default: 15
+      prune_images:
+        description: 'Prune old images after successful deployment'
+        required: false
+        type: boolean
+        default: true
+      prune_age:
+        description: 'Age filter for image pruning (e.g., 168h for 7 days)'
+        required: false
+        type: string
+        default: '168h'
     secrets:
-      registry-username:
+      registry_username:
         description: 'Registry username'
         required: true
-      registry-password:
+      registry_password:
         description: 'Registry password'
         required: true
-      env-variables:
-        description: 'Environment variables for .env file (one per line)'
-        required: true
+      env_file_content:
+        description: 'Content for .env file (multiline string with KEY=VALUE pairs)'
+        required: false
 
 jobs:
   deploy:
-    name: Deploy
-    runs-on: shelly
+    name: Deploy from Registry
+    runs-on: ${{ inputs.runner }}
+    
+    env:
+      DEPLOY_DIR: ${{ inputs.deploy_directory }}
+      REGISTRY: ${{ inputs.registry }}
+      IMAGE_TAG: ${{ inputs.image_tag }}
+    
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - uses: shelly-nas/shared-actions/prepare-deploy-directory@main
-        with:
-          deploy-directory: ${{ inputs.deploy-directory }}
-          source-files: ${{ inputs.compose-source }}:docker-compose.yaml
+      - name: Set image tag
+        id: set-tag
+        run: |
+          echo "IMAGE_TAG=${{ inputs.image_tag }}" >> $GITHUB_OUTPUT
+          echo "Deploying image tag: ${{ inputs.image_tag }}"
 
-      - uses: shelly-nas/shared-actions/create-env-file@main
-        with:
-          working-directory: ${{ inputs.deploy-directory }}
-          variables: ${{ secrets.env-variables }}
+      - name: Create deployment directory
+        run: mkdir -p ${{ env.DEPLOY_DIR }}
 
-      - uses: shelly-nas/shared-actions/docker-compose-stop@main
-        with:
-          working-directory: ${{ inputs.deploy-directory }}
-          compose-file: docker-compose.yaml
+      - name: Copy docker-compose file
+        run: |
+          cp ${{ inputs.compose_file }} ${{ env.DEPLOY_DIR }}/docker-compose.yaml
 
-      - uses: shelly-nas/shared-actions/docker-compose-pull@main
-        with:
-          working-directory: ${{ inputs.deploy-directory }}
-          compose-file: docker-compose.yaml
-          env-file: .env
+      - name: Create .env file
+        working-directory: ${{ env.DEPLOY_DIR }}
+        run: |
+          cat > .env << 'EOF'
+          REGISTRY=${{ env.REGISTRY }}
+          IMAGE_TAG=${{ steps.set-tag.outputs.IMAGE_TAG }}
+          ${{ secrets.env_file_content }}
+          EOF
 
-      - uses: shelly-nas/shared-actions/docker-compose-deploy@main
-        with:
-          registry: ${{ inputs.registry }}
-          username: ${{ secrets.registry-username }}
-          password: ${{ secrets.registry-password }}
-          compose-file: ${{ inputs.deploy-directory }}/docker-compose.yaml
-          env-file: ${{ inputs.deploy-directory }}/.env
-          pull: 'false'
+      - name: Log in to Registry
+        run: |
+          echo "${{ secrets.registry_password }}" | docker login ${{ env.REGISTRY }} -u "${{ secrets.registry_username }}" --password-stdin
 
-      - uses: shelly-nas/shared-actions/docker-compose-health-check@main
-        with:
-          working-directory: ${{ inputs.deploy-directory }}
-          compose-file: docker-compose.yaml
+      - name: Stop existing containers
+        working-directory: ${{ env.DEPLOY_DIR }}
+        run: docker compose down
+        continue-on-error: true
 
-      - name: Cleanup .env
+      - name: Pull latest images
+        working-directory: ${{ env.DEPLOY_DIR }}
+        run: docker compose pull
+
+      - name: Start containers
+        working-directory: ${{ env.DEPLOY_DIR }}
+        run: docker compose --env-file .env up -d
+
+      - name: Wait for services to be healthy
+        run: |
+          echo "Waiting for services to start..."
+          sleep ${{ inputs.health_check_delay }}
+
+      - name: Check container status
+        working-directory: ${{ env.DEPLOY_DIR }}
+        run: docker compose ps
+
+      - name: Verify services are running
+        working-directory: ${{ env.DEPLOY_DIR }}
+        run: |
+          # Check if all containers are running
+          RUNNING=$(docker compose ps --services --filter "status=running" | wc -l)
+          TOTAL=$(docker compose ps --services | wc -l)
+          
+          echo "Running containers: $RUNNING/$TOTAL"
+          
+          if [ "$RUNNING" -ne "$TOTAL" ]; then
+            echo "Not all services are running!"
+            docker compose ps
+            exit 1
+          fi
+
+      - name: Show logs on failure
+        if: failure()
+        working-directory: ${{ env.DEPLOY_DIR }}
+        run: docker compose logs --tail=100
+
+      - name: Clean up credentials
         if: always()
-        run: rm -f ${{ inputs.deploy-directory }}/.env
+        run: |
+          docker logout ${{ env.REGISTRY }}
+          rm -f ${{ env.DEPLOY_DIR }}/.env
 
-      - uses: shelly-nas/shared-actions/docker-cleanup@main
-        if: success()
+      - name: Prune old images
+        if: success() && inputs.prune_images
+        run: docker image prune -f --filter "until=${{ inputs.prune_age }}"
