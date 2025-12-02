@@ -30,7 +30,7 @@ jobs:
         image: ${{ fromJson(inputs.images) }}
     steps:
       - uses: actions/checkout@v4
-      - uses: ShellyNAS/shared-actions/docker-build-push@main
+      - uses: shelly-nas/shared-actions/docker-build-push@main
         with:
           registry: ${{ inputs.registry }}
           username: ${{ secrets.registry-username }}

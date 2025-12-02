@@ -37,28 +37,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: ShellyNAS/shared-actions/prepare-deploy-directory@main
+      - uses: shelly-nas/shared-actions/prepare-deploy-directory@main
         with:
           deploy-directory: ${{ inputs.deploy-directory }}
           source-files: ${{ inputs.compose-source }}:docker-compose.yaml
 
-      - uses: ShellyNAS/shared-actions/create-env-file@main
+      - uses: shelly-nas/shared-actions/create-env-file@main
         with:
           working-directory: ${{ inputs.deploy-directory }}
           variables: ${{ inputs.env-variables }}
 
-      - uses: ShellyNAS/shared-actions/docker-compose-stop@main
+      - uses: shelly-nas/shared-actions/docker-compose-stop@main
         with:
           working-directory: ${{ inputs.deploy-directory }}
           compose-file: docker-compose.yaml
 
-      - uses: ShellyNAS/shared-actions/docker-compose-pull@main
+      - uses: shelly-nas/shared-actions/docker-compose-pull@main
         with:
           working-directory: ${{ inputs.deploy-directory }}
           compose-file: docker-compose.yaml
           env-file: .env
 
-      - uses: ShellyNAS/shared-actions/docker-compose-deploy@main
+      - uses: shelly-nas/shared-actions/docker-compose-deploy@main
         with:
           registry: ${{ inputs.registry }}
           username: ${{ secrets.registry-username }}
@@ -67,7 +67,7 @@ jobs:
           env-file: ${{ inputs.deploy-directory }}/.env
           pull: 'false'
 
-      - uses: ShellyNAS/shared-actions/docker-compose-health-check@main
+      - uses: shelly-nas/shared-actions/docker-compose-health-check@main
         with:
           working-directory: ${{ inputs.deploy-directory }}
           compose-file: docker-compose.yaml
@@ -76,5 +76,5 @@ jobs:
         if: always()
         run: rm -f ${{ inputs.deploy-directory }}/.env
 
-      - uses: ShellyNAS/shared-actions/docker-cleanup@main
+      - uses: shelly-nas/shared-actions/docker-cleanup@main
         if: success()
