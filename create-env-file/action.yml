@@ -34,13 +34,15 @@ runs:
       id: create
       shell: bash
       working-directory: ${{ inputs.working-directory }}
+      env:
+        ENV_VARIABLES: ${{ inputs.variables }}
       run: |
         if [ -f "${{ inputs.file-path }}" ] && [ "${{ inputs.overwrite }}" != "true" ]; then
           echo "::warning title=File Exists::Environment file already exists, skipping"
           exit 0
         fi
         
-        echo '${{ inputs.variables }}' > "${{ inputs.file-path }}"
+        printf '%s\n' "$ENV_VARIABLES" > "${{ inputs.file-path }}"
         chmod "${{ inputs.mode }}" "${{ inputs.file-path }}"
         
         echo "::notice title=Created::Environment file ${{ inputs.file-path }}"
