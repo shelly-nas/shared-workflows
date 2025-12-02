@@ -1,0 +1,16 @@
+name: 'Docker Registry Logout'
+description: 'Log out from a Docker container registry'
+
+inputs:
+  registry:
+    description: 'Container registry URL to logout from'
+    required: true
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Log out from Container Registry
+      shell: bash
+      run: |
+        docker logout ${{ inputs.registry }}
+        echo "::notice title=Logged Out::Disconnected from ${{ inputs.registry }}"

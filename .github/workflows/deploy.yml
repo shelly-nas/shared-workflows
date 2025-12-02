@@ -1,0 +1,80 @@
+# Reusable Deploy Workflow
+
+name: Deploy
+
+on:
+  workflow_call:
+    inputs:
+      registry:
+        description: 'Container registry URL'
+        required: true
+        type: string
+      deploy-directory:
+        description: 'Deployment directory on the runner'
+        required: true
+        type: string
+      compose-source:
+        description: 'Source compose file (renamed to docker-compose.yaml)'
+        required: false
+        type: string
+        default: 'docker-compose.prod.yaml'
+      env-variables:
+        description: 'Environment variables for .env file (one per line)'
+        required: true
+        type: string
+    secrets:
+      registry-username:
+        description: 'Registry username'
+        required: true
+      registry-password:
+        description: 'Registry password'
+        required: true
+
+jobs:
+  deploy:
+    name: Deploy
+    runs-on: shelly
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shelly-nas/shared-actions/prepare-deploy-directory@main
+        with:
+          deploy-directory: ${{ inputs.deploy-directory }}
+          source-files: ${{ inputs.compose-source }}:docker-compose.yaml
+
+      - uses: shelly-nas/shared-actions/create-env-file@main
+        with:
+          working-directory: ${{ inputs.deploy-directory }}
+          variables: ${{ inputs.env-variables }}
+
+      - uses: shelly-nas/shared-actions/docker-compose-stop@main
+        with:
+          working-directory: ${{ inputs.deploy-directory }}
+          compose-file: docker-compose.yaml
+
+      - uses: shelly-nas/shared-actions/docker-compose-pull@main
+        with:
+          working-directory: ${{ inputs.deploy-directory }}
+          compose-file: docker-compose.yaml
+          env-file: .env
+
+      - uses: shelly-nas/shared-actions/docker-compose-deploy@main
+        with:
+          registry: ${{ inputs.registry }}
+          username: ${{ secrets.registry-username }}
+          password: ${{ secrets.registry-password }}
+          compose-file: ${{ inputs.deploy-directory }}/docker-compose.yaml
+          env-file: ${{ inputs.deploy-directory }}/.env
+          pull: 'false'
+
+      - uses: shelly-nas/shared-actions/docker-compose-health-check@main
+        with:
+          working-directory: ${{ inputs.deploy-directory }}
+          compose-file: docker-compose.yaml
+
+      - name: Cleanup .env
+        if: always()
+        run: rm -f ${{ inputs.deploy-directory }}/.env
+
+      - uses: shelly-nas/shared-actions/docker-cleanup@main
+        if: success()

@@ -1,0 +1,39 @@
+name: 'Docker Compose Pull'
+description: 'Pull Docker images defined in a docker-compose file'
+
+inputs:
+  working-directory:
+    description: 'Working directory containing docker-compose file'
+    required: false
+    default: '.'
+  compose-file:
+    description: 'Path to docker-compose file'
+    required: false
+    default: 'docker-compose.yml'
+  project-name:
+    description: 'Docker Compose project name'
+    required: false
+    default: ''
+  env-file:
+    description: 'Path to environment file'
+    required: false
+    default: '.env'
+  services:
+    description: 'Specific services to pull (space-separated)'
+    required: false
+    default: ''
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Pull Docker Compose images
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        COMPOSE="docker compose -f ${{ inputs.compose-file }}"
+        [ -n "${{ inputs.project-name }}" ] && COMPOSE="$COMPOSE -p ${{ inputs.project-name }}"
+        [ -f "${{ inputs.env-file }}" ] && COMPOSE="$COMPOSE --env-file ${{ inputs.env-file }}"
+        
+        echo "::notice title=Pulling::Fetching images..."
+        $COMPOSE pull --parallel ${{ inputs.services }}
+        echo "::notice title=Pulled::All images downloaded successfully"
