@@ -1,0 +1,181 @@
+# Reusable Acceptance Deploy Workflow
+#
+# Deploys a branch to the app's acceptance (acc) stack on the NAS, next to
+# production but fully separate from it: its own directory, containers and
+# database. Production is not touched.
+#
+# Every deploy starts the acc database from scratch: the data directory is
+# emptied, so the database image runs init.sql and seed.sql again, and then the
+# demo seed from the branch is loaded on top. Nothing a previous branch added
+# survives, and every review starts from the same known data.
+
+name: Deploy Acceptance
+
+on:
+  workflow_call:
+    inputs:
+      registry:
+        description: 'Container registry URL'
+        required: true
+        type: string
+      deploy_directory:
+        description: 'Acc deployment directory on the runner, by convention /volume1/docker/<app>-acc'
+        required: true
+        type: string
+      compose_file:
+        description: 'Acc compose file in the repo (copied to the deploy directory as docker-compose.yaml)'
+        required: false
+        type: string
+        default: 'docker-compose.acc.yml'
+      image_tag:
+        description: 'Image tag to deploy'
+        required: true
+        type: string
+      db_service:
+        description: 'Name of the database service in the acc compose file'
+        required: false
+        type: string
+        default: 'db'
+      demo_seed_file:
+        description: 'SQL file in the repo loaded after the schema; empty to skip'
+        required: false
+        type: string
+        default: 'database/seed-demo.sql'
+      runner:
+        description: 'Runner to use for deployment'
+        required: false
+        type: string
+        default: 'shelly'
+      health_check_delay:
+        description: 'Seconds to wait before health check'
+        required: false
+        type: number
+        default: 15
+    secrets:
+      registry_username:
+        description: 'Registry username'
+        required: true
+      registry_password:
+        description: 'Registry password'
+        required: true
+      env_file_content:
+        description: 'Content for .env file (multiline string with KEY=VALUE pairs)'
+        required: false
+
+jobs:
+  deploy:
+    name: Deploy to Acceptance
+    runs-on: ${{ inputs.runner }}
+
+    env:
+      DEPLOY_DIR: ${{ inputs.deploy_directory }}
+      REGISTRY: ${{ inputs.registry }}
+      DB_SERVICE: ${{ inputs.db_service }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # This workflow wipes the database in DEPLOY_DIR. Refuse anything that is
+      # not explicitly an acc directory, so a production path can never be passed.
+      - name: Guard against a non-acc directory
+        run: |
+          case "${DEPLOY_DIR%/}" in
+            *-acc) echo "Deploying to $DEPLOY_DIR" ;;
+            *) echo "deploy_directory must end in '-acc' (got '$DEPLOY_DIR'). Refusing to reset its database."; exit 1 ;;
+          esac
+
+      - name: Copy docker-compose file
+        run: |
+          mkdir -p "$DEPLOY_DIR"
+          cp ${{ inputs.compose_file }} "$DEPLOY_DIR/docker-compose.yaml"
+
+      - name: Create .env file
+        working-directory: ${{ env.DEPLOY_DIR }}
+        run: |
+          cat > .env << 'EOF'
+          REGISTRY=${{ inputs.registry }}
+          IMAGE_TAG=${{ inputs.image_tag }}
+          ${{ secrets.env_file_content }}
+          EOF
+
+      - name: Log in to Registry
+        run: |
+          echo "${{ secrets.registry_password }}" | docker login "$REGISTRY" -u "${{ secrets.registry_username }}" --password-stdin
+
+      - name: Pull images
+        working-directory: ${{ env.DEPLOY_DIR }}
+        run: docker compose pull
+
+      - name: Stop existing acc containers
+        working-directory: ${{ env.DEPLOY_DIR }}
+        run: docker compose down
+        continue-on-error: true
+
+      # The data directory is owned by the postgres user (uid 70), which the
+      # runner cannot delete as itself; Docker runs as root and can.
+      - name: Reset acc data directory
+        run: |
+          mkdir -p "$DEPLOY_DIR/data"
+          docker run --rm -v "$DEPLOY_DIR/data:/data" alpine \
+            sh -c 'rm -rf /data/postgres && mkdir -p /data/postgres && chown 70:70 /data/postgres'
+
+      # pg_isready over TCP: during the first start the entrypoint runs the
+      # init scripts on a temporary server that only listens on the socket, so
+      # TCP only answers once init.sql and seed.sql are done.
+      - name: Start acc database
+        working-directory: ${{ env.DEPLOY_DIR }}
+        run: |
+          docker compose up -d "$DB_SERVICE"
+          for _ in $(seq 1 60); do
+            if docker compose exec -T "$DB_SERVICE" sh -c 'pg_isready -h 127.0.0.1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' >/dev/null 2>&1; then
+              echo "Acc database is ready."
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Acc database did not become ready."
+          docker compose logs --tail=50 "$DB_SERVICE"
+          exit 1
+
+      - name: Load demo data
+        if: inputs.demo_seed_file != ''
+        working-directory: ${{ env.DEPLOY_DIR }}
+        run: |
+          docker compose exec -T "$DB_SERVICE" sh -c \
+            'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' \
+            < "$GITHUB_WORKSPACE/${{ inputs.demo_seed_file }}"
+
+      - name: Start containers
+        working-directory: ${{ env.DEPLOY_DIR }}
+        run: docker compose --env-file .env up -d
+
+      - name: Wait for services to be healthy
+        run: sleep ${{ inputs.health_check_delay }}
+
+      - name: Check container status
+        working-directory: ${{ env.DEPLOY_DIR }}
+        run: docker compose ps
+
+      - name: Verify services are running
+        working-directory: ${{ env.DEPLOY_DIR }}
+        run: |
+          RUNNING=$(docker compose ps --services --filter "status=running" | wc -l)
+          TOTAL=$(docker compose ps --services | wc -l)
+          echo "Running containers: $RUNNING/$TOTAL"
+          if [ "$RUNNING" -ne "$TOTAL" ]; then
+            echo "Not all services are running!"
+            docker compose ps
+            exit 1
+          fi
+
+      - name: Show logs on failure
+        if: failure()
+        working-directory: ${{ env.DEPLOY_DIR }}
+        run: docker compose logs --tail=100
+
+      - name: Clean up credentials
+        if: always()
+        run: |
+          docker logout "$REGISTRY" || true
+          rm -f "$DEPLOY_DIR/.env"
