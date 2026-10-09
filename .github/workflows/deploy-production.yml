@@ -1,0 +1,275 @@
+# Reusable Deploy Workflow
+# Deploys containers using docker compose with registry authentication
+#
+# After every run the runner is cleaned up: images no container uses, dangling
+# anonymous volumes and dangling build cache. With acc_directory set, the app's
+# acceptance stack is torn down as well, but only once the commit running on
+# acc is part of what was just deployed to production.
+
+name: Deploy to production
+
+on:
+  workflow_call:
+    inputs:
+      registry:
+        description: 'Container registry URL'
+        required: true
+        type: string
+      deploy_directory:
+        description: 'Deployment directory on the runner'
+        required: true
+        type: string
+      compose_file:
+        description: 'Source compose file to deploy (will be copied to deploy directory as docker-compose.yaml)'
+        required: false
+        type: string
+        default: 'docker-compose.prod.yaml'
+      image_tag:
+        description: 'Image tag to deploy'
+        required: false
+        type: string
+        default: 'latest'
+      runner:
+        description: 'Runner to use for deployment'
+        required: false
+        type: string
+        default: 'shelly'
+      health_check_delay:
+        description: 'Seconds to wait before health check'
+        required: false
+        type: number
+        default: 15
+      prune_images:
+        description: 'Remove unused images, dangling anonymous volumes and build cache after the run'
+        required: false
+        type: boolean
+        default: true
+      prune_age:
+        description: 'Only prune images older than this (e.g. 168h); empty prunes every unused image'
+        required: false
+        type: string
+        default: ''
+      acc_directory:
+        description: 'Acc directory of the same app (must end in -acc); torn down once its commit is in production. Empty to leave acc alone'
+        required: false
+        type: string
+        default: ''
+    secrets:
+      registry_username:
+        description: 'Registry username'
+        required: true
+      registry_password:
+        description: 'Registry password'
+        required: true
+      env_file_content:
+        description: 'Content for .env file (multiline string with KEY=VALUE pairs)'
+        required: false
+
+jobs:
+  deploy:
+    name: Deploy from Registry
+    runs-on: ${{ inputs.runner }}
+
+    outputs:
+      acc_commit: ${{ steps.acc-commit.outputs.commit }}
+
+    env:
+      DEPLOY_DIR: ${{ inputs.deploy_directory }}
+      REGISTRY: ${{ inputs.registry }}
+      IMAGE_TAG: ${{ inputs.image_tag }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set image tag
+        id: set-tag
+        run: |
+          echo "IMAGE_TAG=${{ inputs.image_tag }}" >> $GITHUB_OUTPUT
+          echo "Deploying image tag: ${{ inputs.image_tag }}"
+
+      - name: Create deployment directory
+        run: mkdir -p ${{ env.DEPLOY_DIR }}
+
+      - name: Copy docker-compose file
+        run: |
+          cp ${{ inputs.compose_file }} ${{ env.DEPLOY_DIR }}/docker-compose.yaml
+
+      - name: Create .env file
+        working-directory: ${{ env.DEPLOY_DIR }}
+        run: |
+          cat > .env << 'EOF'
+          REGISTRY=${{ env.REGISTRY }}
+          IMAGE_TAG=${{ steps.set-tag.outputs.IMAGE_TAG }}
+          ${{ secrets.env_file_content }}
+          EOF
+
+      - name: Log in to Registry
+        run: |
+          echo "${{ secrets.registry_password }}" | docker login ${{ env.REGISTRY }} -u "${{ secrets.registry_username }}" --password-stdin
+
+      - name: Stop existing containers
+        working-directory: ${{ env.DEPLOY_DIR }}
+        run: docker compose down
+        continue-on-error: true
+
+      - name: Pull latest images
+        working-directory: ${{ env.DEPLOY_DIR }}
+        run: docker compose pull
+
+      - name: Start containers
+        working-directory: ${{ env.DEPLOY_DIR }}
+        run: docker compose --env-file .env up -d
+
+      - name: Wait for services to be healthy
+        run: |
+          echo "Waiting for services to start..."
+          sleep ${{ inputs.health_check_delay }}
+
+      - name: Check container status
+        working-directory: ${{ env.DEPLOY_DIR }}
+        run: docker compose ps
+
+      - name: Verify services are running
+        working-directory: ${{ env.DEPLOY_DIR }}
+        run: |
+          # Check if all containers are running
+          RUNNING=$(docker compose ps --services --filter "status=running" | wc -l)
+          TOTAL=$(docker compose ps --services | wc -l)
+          
+          echo "Running containers: $RUNNING/$TOTAL"
+          
+          if [ "$RUNNING" -ne "$TOTAL" ]; then
+            echo "Not all services are running!"
+            docker compose ps
+            exit 1
+          fi
+
+      - name: Show logs on failure
+        if: failure()
+        working-directory: ${{ env.DEPLOY_DIR }}
+        run: docker compose logs --tail=100
+
+      - name: Clean up credentials
+        if: always()
+        run: |
+          docker logout ${{ env.REGISTRY }}
+          rm -f ${{ env.DEPLOY_DIR }}/.env
+
+      # Acc images are tagged acc-<commit>, so the running acc containers tell
+      # which commit is on acc without any state of our own on the NAS.
+      - name: Find the commit on acc
+        id: acc-commit
+        if: success() && inputs.acc_directory != ''
+        env:
+          ACC_DIR: ${{ inputs.acc_directory }}
+        run: |
+          project=$(basename "${ACC_DIR%/}" | tr '[:upper:]' '[:lower:]')
+          commit=$(docker ps -a --filter "label=com.docker.compose.project=$project" --format '{{.Image}}' \
+            | sed -n 's/.*:acc-\([0-9a-f]\{7,40\}\)$/\1/p' | head -n 1)
+          if [ -n "$commit" ]; then
+            echo "Acc ($project) runs commit $commit."
+          else
+            echo "No acc containers found for $project; nothing to tear down."
+          fi
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+
+      # Removes only what nothing uses: an image of a running or stopped
+      # container stays. Anonymous volumes are recognised by their 64-hex name,
+      # so named volumes of stopped stacks are never touched, whatever the
+      # Docker version. Every image can be pulled again from the registry.
+      - name: Clean up unused images and volumes
+        if: always() && inputs.prune_images
+        env:
+          PRUNE_AGE: ${{ inputs.prune_age }}
+        run: |
+          docker image prune -af ${PRUNE_AGE:+--filter "until=$PRUNE_AGE"} || true
+          docker volume ls -q --filter dangling=true | grep -E '^[0-9a-f]{64}$' | xargs -r docker volume rm || true
+          docker builder prune -f || true
+          docker system df || true
+
+  # Runs on GitHub's runner for git history and the gh CLI. The change is in
+  # production when the acc commit itself is in the deployed history (merge
+  # commit) or when a merged pull request containing it is (squash, rebase).
+  acc-check:
+    name: Check whether acc is in production
+    needs: deploy
+    if: inputs.acc_directory != '' && needs.deploy.outputs.acc_commit != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      in_production: ${{ steps.check.outputs.in_production }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compare the acc commit with the deployed commit
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACC_COMMIT: ${{ needs.deploy.outputs.acc_commit }}
+        run: |
+          in_production=false
+          if git merge-base --is-ancestor "$ACC_COMMIT" HEAD 2>/dev/null; then
+            in_production=true
+          else
+            for merged in $(gh api "repos/${{ github.repository }}/commits/$ACC_COMMIT/pulls" \
+                --jq '.[] | select(.merged_at != null) | .merge_commit_sha' 2>/dev/null); do
+              if git merge-base --is-ancestor "$merged" HEAD 2>/dev/null; then
+                in_production=true
+              fi
+            done
+          fi
+          echo "Acc commit $ACC_COMMIT in production: $in_production"
+          echo "in_production=$in_production" >> "$GITHUB_OUTPUT"
+
+  acc-teardown:
+    name: Tear down acc
+    needs: acc-check
+    if: needs.acc-check.outputs.in_production == 'true'
+    runs-on: ${{ inputs.runner }}
+
+    env:
+      ACC_DIR: ${{ inputs.acc_directory }}
+
+    steps:
+      # Everything below is deleted. Refuse anything that is not explicitly an
+      # acc directory, so a production path can never be passed.
+      - name: Guard against a non-acc directory
+        run: |
+          case "${ACC_DIR%/}" in
+            /*-acc) echo "Tearing down $ACC_DIR" ;;
+            *) echo "acc_directory must be absolute and end in '-acc' (got '$ACC_DIR'). Refusing to tear it down."; exit 1 ;;
+          esac
+
+      # By compose label rather than `docker compose down`: the .env was
+      # deleted after the acc deploy, and the compose file refuses to load
+      # without its required variables.
+      - name: Remove acc containers, networks and volumes
+        run: |
+          project=$(basename "${ACC_DIR%/}" | tr '[:upper:]' '[:lower:]')
+          docker ps -aq --filter "label=com.docker.compose.project=$project" | xargs -r docker rm -f
+          docker network ls -q --filter "label=com.docker.compose.project=$project" | xargs -r docker network rm
+          docker volume ls -q --filter "label=com.docker.compose.project=$project" | xargs -r docker volume rm
+
+      # The database files are owned by the postgres user (uid 70), which the
+      # runner cannot delete as itself; Docker runs as root and can.
+      - name: Remove the acc directory
+        run: |
+          if [ -d "$ACC_DIR" ]; then
+            docker run --rm -v "$ACC_DIR:/acc" alpine find /acc -mindepth 1 -delete
+            rmdir "$ACC_DIR"
+          fi
+
+      - name: Clean up unused images and volumes
+        if: always() && inputs.prune_images
+        env:
+          PRUNE_AGE: ${{ inputs.prune_age }}
+        run: |
+          docker image prune -af ${PRUNE_AGE:+--filter "until=$PRUNE_AGE"} || true
+          docker volume ls -q --filter dangling=true | grep -E '^[0-9a-f]{64}$' | xargs -r docker volume rm || true
+          docker builder prune -f || true
+          docker system df || true

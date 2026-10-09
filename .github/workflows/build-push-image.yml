@@ -1,6 +1,6 @@
 # Reusable Build & Push Workflow
 
-name: Build & Push
+name: Build & push Docker image
 
 
 on:

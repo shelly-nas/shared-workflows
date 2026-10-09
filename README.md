@@ -1,13 +1,20 @@
 # Shared Workflows
 
 Reusable GitHub Actions workflows that build Docker images and deploy them with
-docker compose on the Shelly NAS. All run on the self-hosted runner `shelly`.
+docker compose on the Shelly NAS, and the CI that checks every push. The build
+and deploy workflows run on the self-hosted runner `shelly`; CI runs on GitHub's
+runners.
 
 | Workflow | What it does |
 | -------- | ------------ |
-| [`build-push.yml`](.github/workflows/build-push.yml) | Builds **one** image from a directory's `Dockerfile` and pushes it to the registry |
-| [`deploy.yml`](.github/workflows/deploy.yml) | Copies a compose file and a `.env` to a directory on the NAS, pulls the images and starts the stack |
-| [`deploy-acc.yml`](.github/workflows/deploy-acc.yml) | Deploys a branch to the app's acceptance stack, with a fresh database of schema, seed and demo data |
+| [`build-push-image.yml`](.github/workflows/build-push-image.yml) | Builds **one** image from a directory's `Dockerfile` and pushes it to the registry |
+| [`deploy-production.yml`](.github/workflows/deploy-production.yml) | Copies a compose file and a `.env` to a directory on the NAS, pulls the images and starts the stack |
+| [`deploy-acceptance.yml`](.github/workflows/deploy-acceptance.yml) | Deploys a branch to the app's acceptance stack, with a fresh database of schema, seed and demo data |
+| [`ci-node-postgres.yml`](.github/workflows/ci-node-postgres.yml) | CI for an app with a Node server: typecheck, tests, and the schema, seed and migration checks against Postgres |
+
+Every deploy, acc and production, ends by removing what the NAS no longer
+uses: images no container references, dangling anonymous volumes and dangling
+build cache. See [Cleanup](#cleanup).
 
 The conventions around these workflows (release-please, compose layout, Traefik
 labels) live in the `release-deploy` and `docker-traefik` skills of
@@ -21,7 +28,7 @@ One `build-push` job per image, then one `deploy` job that waits for all of them
 ```yaml
 jobs:
   build-server:
-    uses: shelly-nas/shared-workflows/.github/workflows/build-push.yml@main
+    uses: shelly-nas/shared-workflows/.github/workflows/build-push-image.yml@main
     with:
       registry: ${{ vars.REGISTRY_URL }}
       # Comma-separated: the version is what production pins to, latest is a pointer.
@@ -32,7 +39,7 @@ jobs:
 
   deploy:
     needs: [build-server]
-    uses: shelly-nas/shared-workflows/.github/workflows/deploy.yml@main
+    uses: shelly-nas/shared-workflows/.github/workflows/deploy-production.yml@main
     with:
       registry: ${{ vars.REGISTRY_URL }}
       deploy_directory: /volume1/docker/my-app
@@ -51,7 +58,7 @@ release merge; see FinanceApp's
 [`deploy.yml`](https://github.com/shelly-nas/FinanceApp/blob/main/.github/workflows/deploy.yml)
 for the complete pipeline.
 
-## `build-push.yml`
+## `build-push-image.yml`
 
 | Input | Required | Default | Description |
 | ----- | -------- | ------- | ----------- |
@@ -71,7 +78,7 @@ in every repo that uses this workflow.
 Steps: log in, `docker image prune -af`, build, push, remove the local image,
 log out.
 
-## `deploy.yml`
+## `deploy-production.yml`
 
 | Input | Required | Default | Description |
 | ----- | -------- | ------- | ----------- |
@@ -81,8 +88,9 @@ log out.
 | `image_tag` | no | `latest` | Written to `.env` as `IMAGE_TAG`. Pass a version, not `latest` |
 | `runner` | no | `shelly` | Runner label |
 | `health_check_delay` | no | `15` | Seconds to wait after `up` before checking the containers |
-| `prune_images` | no | `true` | Prune old images after a successful deploy |
-| `prune_age` | no | `168h` | Age filter for that prune |
+| `prune_images` | no | `true` | Run the [cleanup](#cleanup) after the deploy |
+| `prune_age` | no | *(empty)* | Only prune images older than this, e.g. `168h`. Empty prunes every unused image |
+| `acc_directory` | no | *(empty)* | The app's acc directory (`/volume1/docker/<app>-acc`). When set, acc is torn down once its change is in production; see below |
 
 | Secret | Required | Description |
 | ------ | -------- | ----------- |
@@ -98,7 +106,19 @@ Steps:
 4. Wait `health_check_delay` seconds, then fail if any service is not running
    (with the last 100 log lines of each service on failure).
 5. Log out and **delete the `.env`**.
-6. Prune images older than `prune_age`.
+6. Run the [cleanup](#cleanup), also when the deploy failed.
+7. With `acc_directory` set: tear down acc if its change is now in production.
+
+**Tearing down acc.** Acc images are tagged `acc-<commit>`, so the running acc
+containers tell which commit is on acc. A job on `ubuntu-latest` then decides
+whether that change is in production: either the commit itself is in the
+deployed history (merge commit), or a merged pull request containing it is
+(squash or rebase merge, looked up with the GitHub API). Only then are the acc
+containers, networks, compose volumes and the whole `acc_directory` removed,
+followed by another cleanup. A pull request that is still under review stays
+on acc, and so does acc when no acc containers exist or the lookup fails. The
+directory must be absolute and end in `-acc`; anything else is refused. The
+next acc deploy recreates it.
 
 Things to know:
 
@@ -115,7 +135,7 @@ Things to know:
 - Only the compose file and the `.env` reach the NAS. Anything else a container
   needs (schema, config) must be baked into its image.
 
-## `deploy-acc.yml`
+## `deploy-acceptance.yml`
 
 Deploys a branch (normally an open pull request) to the app's **acceptance**
 stack: `<subdomain>-acc.shelly-nas.nl`, in its own directory with its own
@@ -132,8 +152,10 @@ Production is not touched.
 | `demo_seed_file` | no | `database/seed-demo.sql` | SQL loaded after the schema; empty to skip |
 | `runner` | no | `shelly` | Runner label |
 | `health_check_delay` | no | `15` | Seconds to wait after `up` before checking the containers |
+| `prune_images` | no | `true` | Run the [cleanup](#cleanup) after the deploy |
+| `prune_age` | no | *(empty)* | Only prune images older than this. Empty prunes every unused image |
 
-Secrets are the same as for `deploy.yml`.
+Secrets are the same as for `deploy-production.yml`.
 
 Steps:
 
@@ -144,7 +166,8 @@ Steps:
 4. Wait until Postgres answers over TCP (it only does once the init scripts are
    done), then load `demo_seed_file` from the checked-out branch.
 5. Start the rest of the stack; the server applies its pending migrations.
-6. Check the containers like `deploy.yml`, log out and delete the `.env`.
+6. Check the containers like `deploy-production.yml`, log out and delete the `.env`.
+7. Run the [cleanup](#cleanup), which removes the previous `acc-<commit>` images.
 
 Because the database is rebuilt on every deploy, data entered on acc does not
 survive the next deploy.
@@ -163,7 +186,7 @@ jobs:
 
   deploy-acc:
     needs: [build-server, build-client, build-db]
-    uses: shelly-nas/shared-workflows/.github/workflows/deploy-acc.yml@main
+    uses: shelly-nas/shared-workflows/.github/workflows/deploy-acceptance.yml@main
     with:
       registry: ${{ vars.REGISTRY_URL }}
       deploy_directory: /volume1/docker/my-app-acc
@@ -175,3 +198,71 @@ jobs:
         DB_USER=${{ vars.DB_USER }}
         DB_PASSWORD=${{ secrets.DB_PASSWORD }}
 ```
+
+## `ci-node-postgres.yml`
+
+The CI from the `release-deploy` standard, for an app with a Node server and
+React client. Call it from `.github/workflows/ci.yml` and keep `on:` and
+`concurrency:` in the app:
+
+```yaml
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    uses: shelly-nas/shared-workflows/.github/workflows/ci-node-postgres.yml@main
+    with:
+      db_user: my_user
+      db_name: my_db
+      seed_check_table: categories
+```
+
+| Input | Required | Default | Description |
+| ----- | -------- | ------- | ----------- |
+| `db_user` | yes | | Database user for the CI Postgres |
+| `db_name` | yes | | Database name for the CI Postgres |
+| `node_version` | no | `22` | Node.js version |
+| `typecheck_projects` | no | `["server", "client"]` | JSON array of directories to run `tsc --noEmit` in |
+| `client_directory` | no | `client` | Directory whose `npm test` runs without a database; empty to skip |
+| `server_directory` | no | `server` | Built, migrated and tested against Postgres |
+| `init_sql` | no | `database/init.sql` | Schema applied to the fresh database |
+| `seed_sql` | no | `database/seed.sql` | Seed applied after the schema and once more; empty to skip |
+| `seed_check_table` | no | *(empty)* | Table whose row count must not change on the second seed. Empty only checks that it does not fail |
+| `migrations_directory` | no | `server/migrations` | Where the `NNN_*.sql` migrations live; checked for duplicate numbers |
+| `migrate_command` | no | `node -e "require('./dist/context/migrations').runMigrations()…"` | Run twice in `server_directory` after the build; the second run must be a no-op. Empty to skip |
+
+Jobs: `Typecheck <dir>` per directory, `Client unit tests`, and `Schema and
+server tests` (build, duplicate migration numbers, schema and seed, seed again,
+migrations twice, `npm test`). The server tests get `DB_HOST`, `DB_PORT`,
+`DB_USER`, `DB_PASSWORD`, `DB_NAME` and `DATABASE_URL` in their environment.
+
+A Python backend is not covered yet; keep the CI from the `release-deploy`
+skill in the app for now.
+
+## Cleanup
+
+`deploy-production.yml` and `deploy-acceptance.yml` end with the same step (unless `prune_images`
+is `false`), and it also runs after a failed deploy:
+
+```bash
+docker image prune -af                       # images no container uses
+docker volume ls -q --filter dangling=true \
+  | grep -E '^[0-9a-f]{64}$' | xargs -r docker volume rm   # anonymous volumes only
+docker builder prune -f                      # dangling build cache
+```
+
+- An image of a running **or stopped** container is kept, so nothing that can
+  still start is affected. Everything removed can be pulled again from the
+  registry, which is also how a rollback works.
+- Only **anonymous** volumes are removed, recognised by their 64-character hex
+  name. Named volumes are never pruned, even of stopped stacks and on Docker
+  versions where `docker volume prune` would remove them. Acc's own named
+  volumes are removed only by the acc teardown.
+- The databases live in bind mounts (`./data/postgres`), which no prune touches.
