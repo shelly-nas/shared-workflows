@@ -191,14 +191,15 @@ jobs:
   # Runs on GitHub's runner for git history and the gh CLI. The change is in
   # production when the acc commit itself is in the deployed history (merge
   # commit) or when a merged pull request containing it is (squash, rebase).
+  # No permissions block: a called workflow may not ask for more than its
+  # caller grants, and repos on the read-only default have no pull-requests
+  # scope, so asking for it fails the whole run at startup. Without that
+  # scope the pull request lookup fails and only the ancestor check counts.
   acc-check:
     name: Check whether acc is in production
     needs: deploy
     if: inputs.acc_directory != '' && needs.deploy.outputs.acc_commit != ''
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: read
     outputs:
       in_production: ${{ steps.check.outputs.in_production }}
     steps:
