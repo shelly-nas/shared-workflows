@@ -6,7 +6,7 @@
 # be a no-op), unique migration numbers, and all migrations twice (the second
 # run must be a no-op). Runs on GitHub's runners, never on the NAS.
 
-name: CI (Node)
+name: "CI: Node + Postgres"
 
 on:
   workflow_call:

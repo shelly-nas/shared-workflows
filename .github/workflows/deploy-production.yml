@@ -6,7 +6,7 @@
 # acceptance stack is torn down as well, but only once the commit running on
 # acc is part of what was just deployed to production.
 
-name: Deploy
+name: Deploy to production
 
 on:
   workflow_call:

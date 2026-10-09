@@ -7,10 +7,10 @@ runners.
 
 | Workflow | What it does |
 | -------- | ------------ |
-| [`build-push.yml`](.github/workflows/build-push.yml) | Builds **one** image from a directory's `Dockerfile` and pushes it to the registry |
-| [`deploy.yml`](.github/workflows/deploy.yml) | Copies a compose file and a `.env` to a directory on the NAS, pulls the images and starts the stack |
-| [`deploy-acc.yml`](.github/workflows/deploy-acc.yml) | Deploys a branch to the app's acceptance stack, with a fresh database of schema, seed and demo data |
-| [`ci-node.yml`](.github/workflows/ci-node.yml) | CI for an app with a Node server: typecheck, tests, and the schema, seed and migration checks against Postgres |
+| [`build-push-image.yml`](.github/workflows/build-push-image.yml) | Builds **one** image from a directory's `Dockerfile` and pushes it to the registry |
+| [`deploy-production.yml`](.github/workflows/deploy-production.yml) | Copies a compose file and a `.env` to a directory on the NAS, pulls the images and starts the stack |
+| [`deploy-acceptance.yml`](.github/workflows/deploy-acceptance.yml) | Deploys a branch to the app's acceptance stack, with a fresh database of schema, seed and demo data |
+| [`ci-node-postgres.yml`](.github/workflows/ci-node-postgres.yml) | CI for an app with a Node server: typecheck, tests, and the schema, seed and migration checks against Postgres |
 
 Every deploy, acc and production, ends by removing what the NAS no longer
 uses: images no container references, dangling anonymous volumes and dangling
@@ -28,7 +28,7 @@ One `build-push` job per image, then one `deploy` job that waits for all of them
 ```yaml
 jobs:
   build-server:
-    uses: shelly-nas/shared-workflows/.github/workflows/build-push.yml@main
+    uses: shelly-nas/shared-workflows/.github/workflows/build-push-image.yml@main
     with:
       registry: ${{ vars.REGISTRY_URL }}
       # Comma-separated: the version is what production pins to, latest is a pointer.
@@ -39,7 +39,7 @@ jobs:
 
   deploy:
     needs: [build-server]
-    uses: shelly-nas/shared-workflows/.github/workflows/deploy.yml@main
+    uses: shelly-nas/shared-workflows/.github/workflows/deploy-production.yml@main
     with:
       registry: ${{ vars.REGISTRY_URL }}
       deploy_directory: /volume1/docker/my-app
@@ -58,7 +58,7 @@ release merge; see FinanceApp's
 [`deploy.yml`](https://github.com/shelly-nas/FinanceApp/blob/main/.github/workflows/deploy.yml)
 for the complete pipeline.
 
-## `build-push.yml`
+## `build-push-image.yml`
 
 | Input | Required | Default | Description |
 | ----- | -------- | ------- | ----------- |
@@ -78,7 +78,7 @@ in every repo that uses this workflow.
 Steps: log in, `docker image prune -af`, build, push, remove the local image,
 log out.
 
-## `deploy.yml`
+## `deploy-production.yml`
 
 | Input | Required | Default | Description |
 | ----- | -------- | ------- | ----------- |
@@ -135,7 +135,7 @@ Things to know:
 - Only the compose file and the `.env` reach the NAS. Anything else a container
   needs (schema, config) must be baked into its image.
 
-## `deploy-acc.yml`
+## `deploy-acceptance.yml`
 
 Deploys a branch (normally an open pull request) to the app's **acceptance**
 stack: `<subdomain>-acc.shelly-nas.nl`, in its own directory with its own
@@ -155,7 +155,7 @@ Production is not touched.
 | `prune_images` | no | `true` | Run the [cleanup](#cleanup) after the deploy |
 | `prune_age` | no | *(empty)* | Only prune images older than this. Empty prunes every unused image |
 
-Secrets are the same as for `deploy.yml`.
+Secrets are the same as for `deploy-production.yml`.
 
 Steps:
 
@@ -166,7 +166,7 @@ Steps:
 4. Wait until Postgres answers over TCP (it only does once the init scripts are
    done), then load `demo_seed_file` from the checked-out branch.
 5. Start the rest of the stack; the server applies its pending migrations.
-6. Check the containers like `deploy.yml`, log out and delete the `.env`.
+6. Check the containers like `deploy-production.yml`, log out and delete the `.env`.
 7. Run the [cleanup](#cleanup), which removes the previous `acc-<commit>` images.
 
 Because the database is rebuilt on every deploy, data entered on acc does not
@@ -186,7 +186,7 @@ jobs:
 
   deploy-acc:
     needs: [build-server, build-client, build-db]
-    uses: shelly-nas/shared-workflows/.github/workflows/deploy-acc.yml@main
+    uses: shelly-nas/shared-workflows/.github/workflows/deploy-acceptance.yml@main
     with:
       registry: ${{ vars.REGISTRY_URL }}
       deploy_directory: /volume1/docker/my-app-acc
@@ -199,7 +199,7 @@ jobs:
         DB_PASSWORD=${{ secrets.DB_PASSWORD }}
 ```
 
-## `ci-node.yml`
+## `ci-node-postgres.yml`
 
 The CI from the `release-deploy` standard, for an app with a Node server and
 React client. Call it from `.github/workflows/ci.yml` and keep `on:` and
@@ -217,7 +217,7 @@ concurrency:
 
 jobs:
   ci:
-    uses: shelly-nas/shared-workflows/.github/workflows/ci-node.yml@main
+    uses: shelly-nas/shared-workflows/.github/workflows/ci-node-postgres.yml@main
     with:
       db_user: my_user
       db_name: my_db
@@ -248,7 +248,7 @@ skill in the app for now.
 
 ## Cleanup
 
-`deploy.yml` and `deploy-acc.yml` end with the same step (unless `prune_images`
+`deploy-production.yml` and `deploy-acceptance.yml` end with the same step (unless `prune_images`
 is `false`), and it also runs after a failed deploy:
 
 ```bash

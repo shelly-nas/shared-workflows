@@ -9,7 +9,7 @@
 # demo seed from the branch is loaded on top. Nothing a previous branch added
 # survives, and every review starts from the same known data.
 
-name: Deploy Acceptance
+name: Deploy to acceptance
 
 on:
   workflow_call:
@@ -191,7 +191,7 @@ jobs:
           rm -f "$DEPLOY_DIR/.env"
 
       # The previous acc-<commit> images are unused once the new stack runs.
-      # Same rules as deploy.yml: only what no container uses, and only
+      # Same rules as deploy-production.yml: only what no container uses, and only
       # anonymous volumes (64-hex names), never named ones.
       - name: Clean up unused images and volumes
         if: always() && inputs.prune_images
