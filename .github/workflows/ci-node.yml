@@ -1,0 +1,210 @@
+# Reusable CI Workflow (Node backend)
+#
+# The CI every shelly-nas app with a Node server runs on each push and pull
+# request: typecheck and unit tests, then the schema checks against a real
+# Postgres - init.sql and seed.sql on a fresh database, the seed again (must
+# be a no-op), unique migration numbers, and all migrations twice (the second
+# run must be a no-op). Runs on GitHub's runners, never on the NAS.
+
+name: CI (Node)
+
+on:
+  workflow_call:
+    inputs:
+      node_version:
+        description: 'Node.js version'
+        required: false
+        type: string
+        default: '22'
+      typecheck_projects:
+        description: 'JSON array of directories to run `tsc --noEmit` in'
+        required: false
+        type: string
+        default: '["server", "client"]'
+      client_directory:
+        description: 'Directory whose `npm test` runs without a database; empty to skip'
+        required: false
+        type: string
+        default: 'client'
+      server_directory:
+        description: 'Server directory; built, migrated and tested against Postgres'
+        required: false
+        type: string
+        default: 'server'
+      db_user:
+        description: 'Database user, as in the compose files'
+        required: true
+        type: string
+      db_name:
+        description: 'Database name, as in the compose files'
+        required: true
+        type: string
+      init_sql:
+        description: 'Schema file applied to the fresh database'
+        required: false
+        type: string
+        default: 'database/init.sql'
+      seed_sql:
+        description: 'Seed file applied after the schema and then once more; empty to skip'
+        required: false
+        type: string
+        default: 'database/seed.sql'
+      seed_check_table:
+        description: 'Table whose row count must not change when the seed runs again; empty only checks that it does not fail'
+        required: false
+        type: string
+        default: ''
+      migrations_directory:
+        description: 'Directory holding the NNN_*.sql migrations'
+        required: false
+        type: string
+        default: 'server/migrations'
+      migrate_command:
+        description: 'Command, run in server_directory after the build, that applies pending migrations; empty to skip'
+        required: false
+        type: string
+        default: >-
+          node -e "require('./dist/context/migrations').runMigrations().then(() => process.exit(0)).catch((e) => { console.error(e); process.exit(1); })"
+
+jobs:
+  typecheck:
+    name: Typecheck ${{ matrix.project }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        project: ${{ fromJSON(inputs.typecheck_projects) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: npm
+          cache-dependency-path: ${{ matrix.project }}/package-lock.json
+      - run: npm ci
+        working-directory: ${{ matrix.project }}
+      - run: npx tsc --noEmit
+        working-directory: ${{ matrix.project }}
+
+  client-tests:
+    name: Client unit tests
+    if: inputs.client_directory != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: npm
+          cache-dependency-path: ${{ inputs.client_directory }}/package-lock.json
+      - run: npm ci
+        working-directory: ${{ inputs.client_directory }}
+      - run: npm test
+        working-directory: ${{ inputs.client_directory }}
+
+  server-tests:
+    name: Schema and server tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ${{ inputs.db_user }}
+          POSTGRES_PASSWORD: ci-password
+          POSTGRES_DB: ${{ inputs.db_name }}
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ${{ inputs.db_user }} -d ${{ inputs.db_name }}"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DB_HOST: localhost
+      DB_PORT: 5432
+      DB_USER: ${{ inputs.db_user }}
+      DB_PASSWORD: ci-password
+      DB_NAME: ${{ inputs.db_name }}
+      DATABASE_URL: postgresql://${{ inputs.db_user }}:ci-password@localhost:5432/${{ inputs.db_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: npm
+          cache-dependency-path: ${{ inputs.server_directory }}/package-lock.json
+      - run: npm ci
+        working-directory: ${{ inputs.server_directory }}
+      - run: npm run build
+        working-directory: ${{ inputs.server_directory }}
+
+      # Numbers must be unique. Two branches each adding 001_ merge cleanly in
+      # git and then collide in production, where one is recorded as applied and
+      # the other silently never runs.
+      - name: Check for duplicate migration numbers
+        env:
+          MIGRATIONS_DIR: ${{ inputs.migrations_directory }}
+        run: |
+          shopt -s nullglob
+          files=("$MIGRATIONS_DIR"/[0-9][0-9][0-9]_*.sql)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No migrations yet - the schema comes from the init script."
+            exit 0
+          fi
+          duplicates=$(printf '%s\n' "${files[@]}" \
+            | xargs -n1 basename | cut -d_ -f1 | sort | uniq -d)
+          if [ -n "$duplicates" ]; then
+            echo "Duplicate migration number(s): $duplicates"
+            exit 1
+          fi
+          echo "Migration numbering is unique."
+
+      # The schema an install actually gets: the init script and the seed,
+      # exactly as the postgres entrypoint runs them.
+      - name: Apply the schema to a fresh database
+        env:
+          INIT_SQL: ${{ inputs.init_sql }}
+          SEED_SQL: ${{ inputs.seed_sql }}
+        run: |
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$INIT_SQL"
+          if [ -n "$SEED_SQL" ]; then
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$SEED_SQL"
+          fi
+
+      # Re-running the seed must be a no-op, so a redeploy cannot duplicate or
+      # overwrite rows the user has edited.
+      - name: Re-run the seed (must be a no-op)
+        if: inputs.seed_sql != ''
+        env:
+          SEED_SQL: ${{ inputs.seed_sql }}
+          CHECK_TABLE: ${{ inputs.seed_check_table }}
+        run: |
+          if [ -z "$CHECK_TABLE" ]; then
+            psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$SEED_SQL"
+            echo "Seed re-ran without errors (set seed_check_table to compare row counts)."
+            exit 0
+          fi
+          before=$(psql "$DATABASE_URL" -t -A -c "SELECT COUNT(*) FROM $CHECK_TABLE")
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f "$SEED_SQL"
+          after=$(psql "$DATABASE_URL" -t -A -c "SELECT COUNT(*) FROM $CHECK_TABLE")
+          if [ "$before" != "$after" ]; then
+            echo "Seed is not idempotent: $before rows in $CHECK_TABLE before, $after after."
+            exit 1
+          fi
+          echo "Seed is idempotent ($after rows in $CHECK_TABLE)."
+
+      # Applied on top of the schema, so a migration added later is exercised
+      # too; the second run must find nothing left to do.
+      - name: Apply pending migrations
+        if: inputs.migrate_command != ''
+        working-directory: ${{ inputs.server_directory }}
+        run: ${{ inputs.migrate_command }}
+
+      - name: Re-run migrations (must be a no-op)
+        if: inputs.migrate_command != ''
+        working-directory: ${{ inputs.server_directory }}
+        run: ${{ inputs.migrate_command }}
+
+      - name: Server tests
+        working-directory: ${{ inputs.server_directory }}
+        run: npm test

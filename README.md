@@ -1,13 +1,16 @@
 # Shared Workflows
 
 Reusable GitHub Actions workflows that build Docker images and deploy them with
-docker compose on the Shelly NAS. All run on the self-hosted runner `shelly`.
+docker compose on the Shelly NAS, and the CI that checks every push. The build
+and deploy workflows run on the self-hosted runner `shelly`; CI runs on GitHub's
+runners.
 
 | Workflow | What it does |
 | -------- | ------------ |
 | [`build-push.yml`](.github/workflows/build-push.yml) | Builds **one** image from a directory's `Dockerfile` and pushes it to the registry |
 | [`deploy.yml`](.github/workflows/deploy.yml) | Copies a compose file and a `.env` to a directory on the NAS, pulls the images and starts the stack |
 | [`deploy-acc.yml`](.github/workflows/deploy-acc.yml) | Deploys a branch to the app's acceptance stack, with a fresh database of schema, seed and demo data |
+| [`ci-node.yml`](.github/workflows/ci-node.yml) | CI for an app with a Node server: typecheck, tests, and the schema, seed and migration checks against Postgres |
 
 Every deploy, acc and production, ends by removing what the NAS no longer
 uses: images no container references, dangling anonymous volumes and dangling
@@ -195,6 +198,53 @@ jobs:
         DB_USER=${{ vars.DB_USER }}
         DB_PASSWORD=${{ secrets.DB_PASSWORD }}
 ```
+
+## `ci-node.yml`
+
+The CI from the `release-deploy` standard, for an app with a Node server and
+React client. Call it from `.github/workflows/ci.yml` and keep `on:` and
+`concurrency:` in the app:
+
+```yaml
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    uses: shelly-nas/shared-workflows/.github/workflows/ci-node.yml@main
+    with:
+      db_user: my_user
+      db_name: my_db
+      seed_check_table: categories
+```
+
+| Input | Required | Default | Description |
+| ----- | -------- | ------- | ----------- |
+| `db_user` | yes | | Database user for the CI Postgres |
+| `db_name` | yes | | Database name for the CI Postgres |
+| `node_version` | no | `22` | Node.js version |
+| `typecheck_projects` | no | `["server", "client"]` | JSON array of directories to run `tsc --noEmit` in |
+| `client_directory` | no | `client` | Directory whose `npm test` runs without a database; empty to skip |
+| `server_directory` | no | `server` | Built, migrated and tested against Postgres |
+| `init_sql` | no | `database/init.sql` | Schema applied to the fresh database |
+| `seed_sql` | no | `database/seed.sql` | Seed applied after the schema and once more; empty to skip |
+| `seed_check_table` | no | *(empty)* | Table whose row count must not change on the second seed. Empty only checks that it does not fail |
+| `migrations_directory` | no | `server/migrations` | Where the `NNN_*.sql` migrations live; checked for duplicate numbers |
+| `migrate_command` | no | `node -e "require('./dist/context/migrations').runMigrations()…"` | Run twice in `server_directory` after the build; the second run must be a no-op. Empty to skip |
+
+Jobs: `Typecheck <dir>` per directory, `Client unit tests`, and `Schema and
+server tests` (build, duplicate migration numbers, schema and seed, seed again,
+migrations twice, `npm test`). The server tests get `DB_HOST`, `DB_PORT`,
+`DB_USER`, `DB_PASSWORD`, `DB_NAME` and `DATABASE_URL` in their environment.
+
+A Python backend is not covered yet; keep the CI from the `release-deploy`
+skill in the app for now.
 
 ## Cleanup
 
