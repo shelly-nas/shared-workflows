@@ -107,7 +107,9 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:16-alpine
+        # The official image through Google's Docker Hub mirror: GitHub's
+        # runners share IPs and regularly hit Docker Hub's anonymous pull limit.
+        image: mirror.gcr.io/library/postgres:16-alpine
         env:
           POSTGRES_USER: ${{ inputs.db_user }}
           POSTGRES_PASSWORD: ci-password
