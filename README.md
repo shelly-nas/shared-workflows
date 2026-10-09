@@ -9,6 +9,10 @@ docker compose on the Shelly NAS. All run on the self-hosted runner `shelly`.
 | [`deploy.yml`](.github/workflows/deploy.yml) | Copies a compose file and a `.env` to a directory on the NAS, pulls the images and starts the stack |
 | [`deploy-acc.yml`](.github/workflows/deploy-acc.yml) | Deploys a branch to the app's acceptance stack, with a fresh database of schema, seed and demo data |
 
+Every deploy, acc and production, ends by removing what the NAS no longer
+uses: images no container references, dangling anonymous volumes and dangling
+build cache. See [Cleanup](#cleanup).
+
 The conventions around these workflows (release-please, compose layout, Traefik
 labels) live in the `release-deploy` and `docker-traefik` skills of
 [shelly-nas/shelly-fundamentals](https://github.com/shelly-nas/shelly-fundamentals).
@@ -81,8 +85,9 @@ log out.
 | `image_tag` | no | `latest` | Written to `.env` as `IMAGE_TAG`. Pass a version, not `latest` |
 | `runner` | no | `shelly` | Runner label |
 | `health_check_delay` | no | `15` | Seconds to wait after `up` before checking the containers |
-| `prune_images` | no | `true` | Prune old images after a successful deploy |
-| `prune_age` | no | `168h` | Age filter for that prune |
+| `prune_images` | no | `true` | Run the [cleanup](#cleanup) after the deploy |
+| `prune_age` | no | *(empty)* | Only prune images older than this, e.g. `168h`. Empty prunes every unused image |
+| `acc_directory` | no | *(empty)* | The app's acc directory (`/volume1/docker/<app>-acc`). When set, acc is torn down once its change is in production; see below |
 
 | Secret | Required | Description |
 | ------ | -------- | ----------- |
@@ -98,7 +103,19 @@ Steps:
 4. Wait `health_check_delay` seconds, then fail if any service is not running
    (with the last 100 log lines of each service on failure).
 5. Log out and **delete the `.env`**.
-6. Prune images older than `prune_age`.
+6. Run the [cleanup](#cleanup), also when the deploy failed.
+7. With `acc_directory` set: tear down acc if its change is now in production.
+
+**Tearing down acc.** Acc images are tagged `acc-<commit>`, so the running acc
+containers tell which commit is on acc. A job on `ubuntu-latest` then decides
+whether that change is in production: either the commit itself is in the
+deployed history (merge commit), or a merged pull request containing it is
+(squash or rebase merge, looked up with the GitHub API). Only then are the acc
+containers, networks, compose volumes and the whole `acc_directory` removed,
+followed by another cleanup. A pull request that is still under review stays
+on acc, and so does acc when no acc containers exist or the lookup fails. The
+directory must be absolute and end in `-acc`; anything else is refused. The
+next acc deploy recreates it.
 
 Things to know:
 
@@ -132,6 +149,8 @@ Production is not touched.
 | `demo_seed_file` | no | `database/seed-demo.sql` | SQL loaded after the schema; empty to skip |
 | `runner` | no | `shelly` | Runner label |
 | `health_check_delay` | no | `15` | Seconds to wait after `up` before checking the containers |
+| `prune_images` | no | `true` | Run the [cleanup](#cleanup) after the deploy |
+| `prune_age` | no | *(empty)* | Only prune images older than this. Empty prunes every unused image |
 
 Secrets are the same as for `deploy.yml`.
 
@@ -145,6 +164,7 @@ Steps:
    done), then load `demo_seed_file` from the checked-out branch.
 5. Start the rest of the stack; the server applies its pending migrations.
 6. Check the containers like `deploy.yml`, log out and delete the `.env`.
+7. Run the [cleanup](#cleanup), which removes the previous `acc-<commit>` images.
 
 Because the database is rebuilt on every deploy, data entered on acc does not
 survive the next deploy.
@@ -175,3 +195,24 @@ jobs:
         DB_USER=${{ vars.DB_USER }}
         DB_PASSWORD=${{ secrets.DB_PASSWORD }}
 ```
+
+## Cleanup
+
+`deploy.yml` and `deploy-acc.yml` end with the same step (unless `prune_images`
+is `false`), and it also runs after a failed deploy:
+
+```bash
+docker image prune -af                       # images no container uses
+docker volume ls -q --filter dangling=true \
+  | grep -E '^[0-9a-f]{64}$' | xargs -r docker volume rm   # anonymous volumes only
+docker builder prune -f                      # dangling build cache
+```
+
+- An image of a running **or stopped** container is kept, so nothing that can
+  still start is affected. Everything removed can be pulled again from the
+  registry, which is also how a rollback works.
+- Only **anonymous** volumes are removed, recognised by their 64-character hex
+  name. Named volumes are never pruned, even of stopped stacks and on Docker
+  versions where `docker volume prune` would remove them. Acc's own named
+  volumes are removed only by the acc teardown.
+- The databases live in bind mounts (`./data/postgres`), which no prune touches.

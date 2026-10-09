@@ -51,6 +51,16 @@ on:
         required: false
         type: number
         default: 15
+      prune_images:
+        description: 'Remove unused images, dangling anonymous volumes and build cache after the run'
+        required: false
+        type: boolean
+        default: true
+      prune_age:
+        description: 'Only prune images older than this (e.g. 168h); empty prunes every unused image'
+        required: false
+        type: string
+        default: ''
     secrets:
       registry_username:
         description: 'Registry username'
@@ -179,3 +189,16 @@ jobs:
         run: |
           docker logout "$REGISTRY" || true
           rm -f "$DEPLOY_DIR/.env"
+
+      # The previous acc-<commit> images are unused once the new stack runs.
+      # Same rules as deploy.yml: only what no container uses, and only
+      # anonymous volumes (64-hex names), never named ones.
+      - name: Clean up unused images and volumes
+        if: always() && inputs.prune_images
+        env:
+          PRUNE_AGE: ${{ inputs.prune_age }}
+        run: |
+          docker image prune -af ${PRUNE_AGE:+--filter "until=$PRUNE_AGE"} || true
+          docker volume ls -q --filter dangling=true | grep -E '^[0-9a-f]{64}$' | xargs -r docker volume rm || true
+          docker builder prune -f || true
+          docker system df || true
