@@ -1,0 +1,109 @@
+# Reusable Acceptance Teardown Workflow
+#
+# Removes the app's acceptance (acc) stack when the pull request on it is
+# merged or closed, so acc does not hold containers, a database and images on
+# the NAS while nothing is under review. Call it from the app's acc workflow on
+# `pull_request: closed`.
+#
+# Acc is only torn down when it still runs the given commit. Acc images are
+# tagged acc-<commit>, so the running containers tell what is on acc; if
+# another pull request (or a branch put there by hand) has been deployed since,
+# that one is under review and stays. With no acc containers there is nothing
+# to do. The next acc deploy recreates everything.
+#
+# deploy-production.yml's acc_directory teardown stays the fallback for a
+# branch that was put on acc by hand and never had a pull request close.
+
+name: Tear down acceptance
+
+on:
+  workflow_call:
+    inputs:
+      acc_directory:
+        description: 'Acc directory on the runner, by convention /volume1/docker/<app>-acc; must end in -acc'
+        required: true
+        type: string
+      commit:
+        description: 'Head commit of the closed pull request; acc is only torn down while it runs this commit'
+        required: true
+        type: string
+      runner:
+        description: 'Runner to use'
+        required: false
+        type: string
+        default: 'shelly'
+      prune_images:
+        description: 'Remove unused images, dangling anonymous volumes and build cache after the teardown'
+        required: false
+        type: boolean
+        default: true
+      prune_age:
+        description: 'Only prune images older than this (e.g. 168h); empty prunes every unused image'
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  teardown:
+    name: Tear down acc
+    runs-on: ${{ inputs.runner }}
+
+    env:
+      ACC_DIR: ${{ inputs.acc_directory }}
+      COMMIT: ${{ inputs.commit }}
+
+    steps:
+      # Everything below is deleted. Refuse anything that is not explicitly an
+      # acc directory, so a production path can never be passed.
+      - name: Guard against a non-acc directory
+        run: |
+          case "${ACC_DIR%/}" in
+            /*-acc) echo "Acc directory: $ACC_DIR" ;;
+            *) echo "acc_directory must be absolute and end in '-acc' (got '$ACC_DIR'). Refusing to tear it down."; exit 1 ;;
+          esac
+
+      - name: Check that acc runs this commit
+        id: check
+        run: |
+          project=$(basename "${ACC_DIR%/}" | tr '[:upper:]' '[:lower:]')
+          running=$(docker ps -a --filter "label=com.docker.compose.project=$project" --format '{{.Image}}' \
+            | sed -n 's/.*:acc-\([0-9a-f]\{7,40\}\)$/\1/p' | head -n 1)
+          if [ -z "$running" ]; then
+            echo "No acc containers found for $project; nothing to tear down."
+          elif [ "$running" = "$COMMIT" ]; then
+            echo "Acc runs $running, the closed pull request; tearing it down."
+            echo "teardown=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Acc runs $running, not $COMMIT; another change is under review, leaving acc up."
+          fi
+
+      # By compose label rather than `docker compose down`: the .env was
+      # deleted after the acc deploy, and the compose file refuses to load
+      # without its required variables.
+      - name: Remove acc containers, networks and volumes
+        if: steps.check.outputs.teardown == 'true'
+        run: |
+          project=$(basename "${ACC_DIR%/}" | tr '[:upper:]' '[:lower:]')
+          docker ps -aq --filter "label=com.docker.compose.project=$project" | xargs -r docker rm -f
+          docker network ls -q --filter "label=com.docker.compose.project=$project" | xargs -r docker network rm
+          docker volume ls -q --filter "label=com.docker.compose.project=$project" | xargs -r docker volume rm
+
+      # The database files are owned by the postgres user (uid 70), which the
+      # runner cannot delete as itself; Docker runs as root and can.
+      - name: Remove the acc directory
+        if: steps.check.outputs.teardown == 'true'
+        run: |
+          if [ -d "$ACC_DIR" ]; then
+            docker run --rm -v "$ACC_DIR:/acc" alpine find /acc -mindepth 1 -delete
+            rmdir "$ACC_DIR"
+          fi
+
+      - name: Clean up unused images and volumes
+        if: steps.check.outputs.teardown == 'true' && inputs.prune_images
+        env:
+          PRUNE_AGE: ${{ inputs.prune_age }}
+        run: |
+          docker image prune -af ${PRUNE_AGE:+--filter "until=$PRUNE_AGE"} || true
+          docker volume ls -q --filter dangling=true | grep -E '^[0-9a-f]{64}$' | xargs -r docker volume rm || true
+          docker builder prune -f || true
+          docker system df || true
