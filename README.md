@@ -10,6 +10,7 @@ runners.
 | [`build-push-image.yml`](.github/workflows/build-push-image.yml) | Builds **one** image from a directory's `Dockerfile` and pushes it to the registry |
 | [`deploy-production.yml`](.github/workflows/deploy-production.yml) | Copies a compose file and a `.env` to a directory on the NAS, pulls the images and starts the stack |
 | [`deploy-acceptance.yml`](.github/workflows/deploy-acceptance.yml) | Deploys a branch to the app's acceptance stack, with a fresh database of schema, seed and demo data |
+| [`teardown-acceptance.yml`](.github/workflows/teardown-acceptance.yml) | Removes the acceptance stack when the pull request on it is merged or closed |
 | [`ci-node-postgres.yml`](.github/workflows/ci-node-postgres.yml) | CI for an app with a Node server: typecheck, tests, and the schema, seed and migration checks against Postgres |
 
 Every deploy, acc and production, ends by removing what the NAS no longer
@@ -90,7 +91,7 @@ log out.
 | `health_check_delay` | no | `15` | Seconds to wait after `up` before checking the containers |
 | `prune_images` | no | `true` | Run the [cleanup](#cleanup) after the deploy |
 | `prune_age` | no | *(empty)* | Only prune images older than this, e.g. `168h`. Empty prunes every unused image |
-| `acc_directory` | no | *(empty)* | The app's acc directory (`/volume1/docker/<app>-acc`). When set, acc is torn down once its change is in production; see below |
+| `acc_directory` | no | *(empty)* | The app's acc directory (`/volume1/docker/<app>-acc`). When set, acc is torn down once its change is in production; see below. The fallback for [`teardown-acceptance.yml`](#teardown-acceptanceyml) |
 
 | Secret | Required | Description |
 | ------ | -------- | ----------- |
@@ -119,6 +120,10 @@ followed by another cleanup. A pull request that is still under review stays
 on acc, and so does acc when no acc containers exist or the lookup fails. The
 directory must be absolute and end in `-acc`; anything else is refused. The
 next acc deploy recreates it.
+
+Normally acc is already gone by then: [`teardown-acceptance.yml`](#teardown-acceptanceyml)
+removes it as soon as its pull request closes. This teardown catches what that
+misses, such as a branch put on acc by hand.
 
 Things to know:
 
@@ -176,15 +181,18 @@ survive the next deploy.
 on:
   pull_request:
     branches: [main]
+    types: [opened, synchronize, reopened, closed]
 
 concurrency:
   group: acc-deploy
-  cancel-in-progress: true
+  # A teardown waits for a running deploy instead of cancelling it.
+  cancel-in-progress: ${{ github.event.action != 'closed' }}
 
 jobs:
   # build-push jobs tagging the images acc-${{ github.event.pull_request.head.sha }}
 
   deploy-acc:
+    if: github.event.action != 'closed'
     needs: [build-server, build-client, build-db]
     uses: shelly-nas/shared-workflows/.github/workflows/deploy-acceptance.yml@main
     with:
@@ -197,6 +205,42 @@ jobs:
       env_file_content: |
         DB_USER=${{ vars.DB_USER }}
         DB_PASSWORD=${{ secrets.DB_PASSWORD }}
+```
+
+## `teardown-acceptance.yml`
+
+Removes the app's acc stack when the pull request on it is merged or closed,
+so acc does not use the NAS while nothing is under review. Call it from the
+acc workflow on `pull_request: closed`.
+
+| Input | Required | Default | Description |
+| ----- | -------- | ------- | ----------- |
+| `acc_directory` | yes | | Acc directory on the NAS. **Must end in `-acc`**; anything else is refused |
+| `commit` | yes | | Head commit of the closed pull request |
+| `runner` | no | `shelly` | Runner label |
+| `prune_images` | no | `true` | Run the [cleanup](#cleanup) after the teardown |
+| `prune_age` | no | *(empty)* | Only prune images older than this. Empty prunes every unused image |
+
+Acc is only torn down while it **still runs `commit`**: the running containers'
+`acc-<commit>` image tag is compared with it. If another pull request or a
+branch put there by hand has been deployed since, that one is under review and
+acc stays. With no acc containers there is nothing to do. Otherwise the acc
+containers, networks, compose volumes and the whole `acc_directory` are
+removed, followed by the cleanup. The next acc deploy recreates everything.
+
+Add it to the acc workflow next to the deploy (see the example above for the
+`closed` trigger and the concurrency):
+
+```yaml
+  teardown-acc:
+    if: >-
+      github.event.action == 'closed' &&
+      !startsWith(github.head_ref, 'release-please--') &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    uses: shelly-nas/shared-workflows/.github/workflows/teardown-acceptance.yml@main
+    with:
+      acc_directory: /volume1/docker/my-app-acc
+      commit: ${{ github.event.pull_request.head.sha }}
 ```
 
 ## `ci-node-postgres.yml`
@@ -249,7 +293,8 @@ skill in the app for now.
 ## Cleanup
 
 `deploy-production.yml` and `deploy-acceptance.yml` end with the same step (unless `prune_images`
-is `false`), and it also runs after a failed deploy:
+is `false`), and it also runs after a failed deploy. `teardown-acceptance.yml`
+runs it after a teardown:
 
 ```bash
 docker image prune -af                       # images no container uses
@@ -264,5 +309,5 @@ docker builder prune -f                      # dangling build cache
 - Only **anonymous** volumes are removed, recognised by their 64-character hex
   name. Named volumes are never pruned, even of stopped stacks and on Docker
   versions where `docker volume prune` would remove them. Acc's own named
-  volumes are removed only by the acc teardown.
+  volumes are removed only by an acc teardown.
 - The databases live in bind mounts (`./data/postgres`), which no prune touches.
