@@ -47,20 +47,38 @@ jobs:
         run: |
           docker image prune -af || true
       
+      # image_tag may hold several references separated by commas (a version
+      # and latest); docker build takes one --tag per reference.
       - name: Build Docker image
         working-directory: ${{ inputs.context }}
+        env:
+          IMAGE_TAGS: ${{ inputs.image_tag }}
         run: |
-          docker build \
-            --tag ${{ inputs.image_tag }} \
-            --file Dockerfile \
-            .
-      
+          args=()
+          IFS=',' read -ra tags <<< "$IMAGE_TAGS"
+          for tag in "${tags[@]}"; do
+            args+=(--tag "$(echo "$tag" | xargs)")
+          done
+          docker build "${args[@]}" --file Dockerfile .
+
       - name: Push Docker image
-        run: docker push ${{ inputs.image_tag }}
-      
+        env:
+          IMAGE_TAGS: ${{ inputs.image_tag }}
+        run: |
+          IFS=',' read -ra tags <<< "$IMAGE_TAGS"
+          for tag in "${tags[@]}"; do
+            docker push "$(echo "$tag" | xargs)"
+          done
+
       - name: Remove local image
         if: always()
-        run: docker image rm -f ${{ inputs.image_tag }} || true
+        env:
+          IMAGE_TAGS: ${{ inputs.image_tag }}
+        run: |
+          IFS=',' read -ra tags <<< "$IMAGE_TAGS"
+          for tag in "${tags[@]}"; do
+            docker image rm -f "$(echo "$tag" | xargs)" || true
+          done
       
       - name: Log out from Registry
         if: always()
