@@ -111,8 +111,9 @@ Steps:
 7. With `acc_directory` set: tear down acc if its change is now in production.
 
 **Tearing down acc.** Acc images are tagged `acc-<commit>`, so the running acc
-containers tell which commit is on acc. A job on `ubuntu-latest` then decides
-whether that change is in production: either the commit itself is in the
+containers tell which commit is on acc. It is read from the image each
+container was created from, which survives the tag being removed later. A job
+on `ubuntu-latest` then decides whether that change is in production: either the commit itself is in the
 deployed history (merge commit), or a merged pull request containing it is
 (squash or rebase merge, looked up with the GitHub API). Only then are the acc
 containers, networks, compose volumes and the whole `acc_directory` removed,
