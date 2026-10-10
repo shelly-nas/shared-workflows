@@ -165,7 +165,12 @@ jobs:
           ACC_DIR: ${{ inputs.acc_directory }}
         run: |
           project=$(basename "${ACC_DIR%/}" | tr '[:upper:]' '[:lower:]')
-          commit=$(docker ps -a --filter "label=com.docker.compose.project=$project" --format '{{.Image}}' \
+          # The image a container was created from, as named in the compose file
+          # (registry/app:acc-<commit>). Not `docker ps`'s Image column: that
+          # shows the bare image ID once the tag has moved or been removed, as
+          # build-push-image's forced `docker image rm` on this runner can do.
+          commit=$(docker ps -aq --filter "label=com.docker.compose.project=$project" \
+            | xargs -r docker inspect --format '{{.Config.Image}}' \
             | sed -n 's/.*:acc-\([0-9a-f]\{7,40\}\)$/\1/p' | head -n 1)
           if [ -n "$commit" ]; then
             echo "Acc ($project) runs commit $commit."
