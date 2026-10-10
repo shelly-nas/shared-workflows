@@ -1,6 +1,11 @@
 # Reusable Deploy Workflow
 # Deploys containers using docker compose with registry authentication
 #
+# Persistent data lives in external Docker volumes named in persistent_volumes.
+# This workflow creates them when they are missing and never removes them: not
+# on a redeploy, not with the cleanup, and `docker compose down -v` cannot
+# either, because compose does not own an external volume.
+#
 # After every run the runner is cleaned up: images no container uses, dangling
 # anonymous volumes and dangling build cache. With acc_directory set, the app's
 # acceptance stack is torn down as well, but only once the commit running on
@@ -51,6 +56,11 @@ on:
         default: ''
       acc_directory:
         description: 'Acc directory of the same app (must end in -acc); torn down once its commit is in production. Empty to leave acc alone'
+        required: false
+        type: string
+        default: ''
+      persistent_volumes:
+        description: 'External Docker volumes the compose file uses for persistent data (space-separated names); created when missing, never removed'
         required: false
         type: string
         default: ''
@@ -108,9 +118,30 @@ jobs:
         run: |
           echo "${{ secrets.registry_password }}" | docker login ${{ env.REGISTRY }} -u "${{ secrets.registry_username }}" --password-stdin
 
+      # Created before the stack is touched: `up` refuses to start a service
+      # whose external volume does not exist. An existing volume, with the
+      # production data in it, is left exactly as it is.
+      - name: Create persistent volumes
+        if: inputs.persistent_volumes != ''
+        env:
+          VOLUMES: ${{ inputs.persistent_volumes }}
+        run: |
+          for volume in $VOLUMES; do
+            if docker volume inspect "$volume" >/dev/null 2>&1; then
+              echo "Volume $volume exists; keeping its data."
+            else
+              docker volume create "$volume"
+              echo "Created volume $volume."
+            fi
+          done
+
+      # No -v: volumes stay. --remove-orphans removes containers of services
+      # that are no longer in the compose file, for example the single app
+      # container of an older layout, so they do not keep running next to the
+      # new stack or claim its Traefik router names.
       - name: Stop existing containers
         working-directory: ${{ env.DEPLOY_DIR }}
-        run: docker compose down
+        run: docker compose down --remove-orphans
         continue-on-error: true
 
       - name: Pull latest images
@@ -119,7 +150,7 @@ jobs:
 
       - name: Start containers
         working-directory: ${{ env.DEPLOY_DIR }}
-        run: docker compose --env-file .env up -d
+        run: docker compose --env-file .env up -d --remove-orphans
 
       - name: Wait for services to be healthy
         run: |
