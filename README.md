@@ -17,7 +17,7 @@ Every deploy, acc and production, ends by removing what the NAS no longer
 uses: images no container references, dangling anonymous volumes and dangling
 build cache. See [Cleanup](#cleanup).
 
-The conventions around these workflows (release-please, compose layout, Traefik
+The conventions around these workflows (deploy flow, compose layout, Traefik
 labels) live in the `release-deploy` and `docker-traefik` skills of
 [shelly-nas/shelly-fundamentals](https://github.com/shelly-nas/shelly-fundamentals).
 `shelly-nas/FinanceApp` is the reference implementation.
@@ -32,8 +32,8 @@ jobs:
     uses: shelly-nas/shared-workflows/.github/workflows/build-push-image.yml@main
     with:
       registry: ${{ vars.REGISTRY_URL }}
-      # Comma-separated: the version is what production pins to, latest is a pointer.
-      image_tag: ${{ vars.REGISTRY_URL }}/my-app-server:1.2.3,${{ vars.REGISTRY_URL }}/my-app-server:latest
+      # Comma-separated: the commit is what production pins to, latest is a pointer.
+      image_tag: ${{ vars.REGISTRY_URL }}/my-app-server:${{ github.sha }},${{ vars.REGISTRY_URL }}/my-app-server:latest
       context: ./server
     secrets:
       registry_password: ${{ secrets.REGISTRY_PASSWORD }}
@@ -45,7 +45,9 @@ jobs:
       registry: ${{ vars.REGISTRY_URL }}
       deploy_directory: /volume1/docker/my-app
       compose_file: docker-compose.prod.yml
-      image_tag: 1.2.3
+      image_tag: ${{ github.sha }}
+      persistent_volumes: my-app-db-data
+      acc_directory: /volume1/docker/my-app-acc
     secrets:
       registry_username: ${{ vars.REGISTRY_USERNAME }}
       registry_password: ${{ secrets.REGISTRY_PASSWORD }}
@@ -54,10 +56,9 @@ jobs:
         DB_PASSWORD=${{ secrets.DB_PASSWORD }}
 ```
 
-In practice the version comes from release-please and the jobs only run on the
-release merge; see FinanceApp's
-[`deploy.yml`](https://github.com/shelly-nas/FinanceApp/blob/main/.github/workflows/deploy.yml)
-for the complete pipeline.
+In practice these jobs run on every push to `main`: a pull request is reviewed
+on acc, and merging it deploys it to production. The `release-deploy` skill in
+shelly-fundamentals has the complete `deploy.yml`.
 
 ## `build-push-image.yml`
 
@@ -86,12 +87,13 @@ log out.
 | `registry` | yes | | Registry host; also written to `.env` as `REGISTRY` |
 | `deploy_directory` | yes | | Directory on the NAS, by convention `/volume1/docker/<app>` |
 | `compose_file` | no | `docker-compose.prod.yaml` | Compose file in the repo; copied to the deploy directory as `docker-compose.yaml`. Note the `.yaml` default - pass it explicitly if yours is `.yml` |
-| `image_tag` | no | `latest` | Written to `.env` as `IMAGE_TAG`. Pass a version, not `latest` |
+| `image_tag` | no | `latest` | Written to `.env` as `IMAGE_TAG`. Pass the commit (or a version), not `latest` |
 | `runner` | no | `shelly` | Runner label |
 | `health_check_delay` | no | `15` | Seconds to wait after `up` before checking the containers |
 | `prune_images` | no | `true` | Run the [cleanup](#cleanup) after the deploy |
 | `prune_age` | no | *(empty)* | Only prune images older than this, e.g. `168h`. Empty prunes every unused image |
 | `acc_directory` | no | *(empty)* | The app's acc directory (`/volume1/docker/<app>-acc`). When set, acc is torn down once its change is in production; see below. The fallback for [`teardown-acceptance.yml`](#teardown-acceptanceyml) |
+| `persistent_volumes` | no | *(empty)* | External Docker volumes the compose file uses for data, space-separated (`my-app-db-data`). Created when missing, **never removed**; see [Persistent data](#persistent-data) |
 
 | Secret | Required | Description |
 | ------ | -------- | ----------- |
@@ -103,12 +105,19 @@ Steps:
 
 1. Copy the compose file to `deploy_directory/docker-compose.yaml`.
 2. Write `.env` with `REGISTRY`, `IMAGE_TAG` and `env_file_content`.
-3. Log in, `docker compose down`, `docker compose pull`, `docker compose up -d`.
-4. Wait `health_check_delay` seconds, then fail if any service is not running
+3. Create each of `persistent_volumes` that does not exist yet.
+4. Log in, `docker compose down --remove-orphans`, `docker compose pull`,
+   `docker compose up -d --remove-orphans`.
+5. Wait `health_check_delay` seconds, then fail if any service is not running
    (with the last 100 log lines of each service on failure).
-5. Log out and **delete the `.env`**.
-6. Run the [cleanup](#cleanup), also when the deploy failed.
-7. With `acc_directory` set: tear down acc if its change is now in production.
+6. Log out and **delete the `.env`**.
+7. Run the [cleanup](#cleanup), also when the deploy failed.
+8. With `acc_directory` set: tear down acc if its change is now in production.
+
+`--remove-orphans` removes containers of services that are no longer in the
+compose file, such as the single app container of an older layout. Without it
+they keep running next to the new stack, and their Traefik labels can claim the
+same router names.
 
 **Tearing down acc.** Acc images are tagged `acc-<commit>`, so the running acc
 containers tell which commit is on acc. It is read from the image each
@@ -132,7 +141,7 @@ Things to know:
   environment and `restart: always` brings them back after a reboot, but a manual
   `docker compose up` in the deploy directory fails on the required variables. To
   roll back or restart by hand, recreate the `.env` first, or rerun the deploy
-  with the earlier version.
+  on the earlier commit.
 - **The stack is stopped before the new images are pulled**, so there is a short
   outage on every deploy, longer if the pull is slow.
 - **The check means "running", not "healthy".** Give services a `healthcheck` in
@@ -236,7 +245,6 @@ Add it to the acc workflow next to the deploy (see the example above for the
   teardown-acc:
     if: >-
       github.event.action == 'closed' &&
-      !startsWith(github.head_ref, 'release-please--') &&
       github.event.pull_request.head.repo.full_name == github.repository
     uses: shelly-nas/shared-workflows/.github/workflows/teardown-acceptance.yml@main
     with:
@@ -311,4 +319,34 @@ docker builder prune -f                      # dangling build cache
   name. Named volumes are never pruned, even of stopped stacks and on Docker
   versions where `docker volume prune` would remove them. Acc's own named
   volumes are removed only by an acc teardown.
-- The databases live in bind mounts (`./data/postgres`), which no prune touches.
+- Production databases live in external volumes (see below) and acc databases
+  in a bind mount (`./data/postgres` in the acc directory); no prune touches either.
+
+## Persistent data
+
+Production data lives in an **external Docker volume** with a fixed name, one
+per app, declared like this in the production compose file:
+
+```yaml
+services:
+  db:
+    volumes:
+      - db_data:/var/lib/postgresql/data
+
+volumes:
+  db_data:
+    external: true
+    name: my-app-db-data
+```
+
+and passed to the deploy as `persistent_volumes: my-app-db-data`.
+
+- `deploy-production.yml` creates the volume on the first deploy and from then
+  on only reuses it. Every later deploy, a push to `main` included, starts the
+  new containers on the same volume.
+- Compose does not own an external volume, so `docker compose down -v` leaves
+  it alone; so do the cleanup and the acc teardown (they only remove anonymous
+  volumes and volumes labelled with the acc project).
+- The name is fixed, so it does not depend on the directory or compose project
+  name. Removing it is always a deliberate `docker volume rm my-app-db-data`.
+- Acc does not use one: its database is rebuilt on every deploy.
