@@ -4,7 +4,8 @@
 # request: typecheck and unit tests, then the schema checks against a real
 # Postgres - init.sql and seed.sql on a fresh database, the seed again (must
 # be a no-op), unique migration numbers, and all migrations twice (the second
-# run must be a no-op). Runs on GitHub's runners, never on the NAS.
+# run must be a no-op). Optionally measures test coverage of the client and the
+# server and fails below a minimum. Runs on GitHub's runners, never on the NAS.
 
 name: "CI: Node + Postgres"
 
@@ -59,6 +60,30 @@ on:
         required: false
         type: string
         default: 'server/migrations'
+      client_coverage_threshold:
+        description: >-
+          Minimum client coverage in percent, applied to lines, branches, functions and
+          statements. Empty skips measuring; 0 measures and reports without failing.
+        required: false
+        type: string
+        default: ''
+      server_coverage_threshold:
+        description: >-
+          Minimum server coverage in percent, applied to lines, branches, functions and
+          statements. Empty skips measuring; 0 measures and reports without failing.
+        required: false
+        type: string
+        default: ''
+      server_coverage_include:
+        description: 'Glob of the built server code that coverage counts, relative to server_directory'
+        required: false
+        type: string
+        default: 'dist/**/*.js'
+      server_coverage_exclude:
+        description: 'Comma-separated globs left out of server coverage (tests, fixtures)'
+        required: false
+        type: string
+        default: 'dist/**/*.test.js,dist/**/__tests__/**'
       migrate_command:
         description: 'Command, run in server_directory after the build, that applies pending migrations; empty to skip'
         required: false
@@ -99,8 +124,57 @@ jobs:
           cache-dependency-path: ${{ inputs.client_directory }}/package-lock.json
       - run: npm ci
         working-directory: ${{ inputs.client_directory }}
-      - run: npm test
+      - name: Client tests
+        if: inputs.client_coverage_threshold == ''
+        run: npm test
         working-directory: ${{ inputs.client_directory }}
+
+      # Vitest measures coverage itself. @vitest/coverage-v8 must match the
+      # installed vitest exactly, so it is added at that version when the app
+      # does not have it yet. Untested files under src/ count as 0%.
+      - name: Client tests with coverage
+        if: inputs.client_coverage_threshold != ''
+        working-directory: ${{ inputs.client_directory }}
+        env:
+          THRESHOLD: ${{ inputs.client_coverage_threshold }}
+        run: |
+          if ! node -e "require.resolve('@vitest/coverage-v8/package.json')" 2>/dev/null; then
+            version=$(node -p "require('vitest/package.json').version")
+            npm install --no-save "@vitest/coverage-v8@$version"
+          fi
+          npm test -- --coverage.enabled=true --coverage.provider=v8 \
+            --coverage.include='src/**' \
+            --coverage.reporter=text --coverage.reporter=json-summary \
+            --coverage.reportsDirectory=coverage \
+            --coverage.thresholds.lines="$THRESHOLD" --coverage.thresholds.branches="$THRESHOLD" \
+            --coverage.thresholds.functions="$THRESHOLD" --coverage.thresholds.statements="$THRESHOLD"
+
+      # Writes the totals to the job summary, so the numbers are on the run
+      # page without opening the logs.
+      - name: Client coverage summary
+        if: always() && inputs.client_coverage_threshold != ''
+        working-directory: ${{ inputs.client_directory }}
+        env:
+          THRESHOLD: ${{ inputs.client_coverage_threshold }}
+          LABEL: Client
+        run: |
+          cat > "$RUNNER_TEMP/coverage-summary.js" <<'JS'
+            const fs = require('fs');
+            const file = process.argv[2];
+            const label = process.env.LABEL, min = Number(process.env.THRESHOLD);
+            let out;
+            if (!fs.existsSync(file)) {
+              out = `### ${label} coverage\n\nNo coverage report: the tests did not finish.\n`;
+            } else {
+              const t = JSON.parse(fs.readFileSync(file, 'utf8')).total;
+              const rows = ['lines', 'branches', 'functions', 'statements'].map((k) =>
+                `| ${k} | ${t[k].pct}% | ${t[k].pct >= min ? 'ok' : 'below ' + min + '%'} |`);
+              out = `### ${label} coverage (minimum ${min}%)\n\n| | coverage | |\n|---|---|---|\n${rows.join('\n')}\n`;
+            }
+            fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, out + '\n');
+            console.log(out);
+          JS
+          node "$RUNNER_TEMP/coverage-summary.js" coverage/coverage-summary.json
 
   server-tests:
     name: Schema and server tests
@@ -208,5 +282,55 @@ jobs:
         run: ${{ inputs.migrate_command }}
 
       - name: Server tests
+        if: inputs.server_coverage_threshold == ''
         working-directory: ${{ inputs.server_directory }}
         run: npm test
+
+      # c8 records V8 coverage of everything npm test starts, including the
+      # processes node --test spawns per file. It counts the built code
+      # (server_coverage_include), mapped back to the sources when the build
+      # emits source maps; --all makes untested files count as 0%. Coverage
+      # through tsx is not used: it reports untested lines as covered.
+      - name: Server tests with coverage
+        if: inputs.server_coverage_threshold != ''
+        working-directory: ${{ inputs.server_directory }}
+        env:
+          THRESHOLD: ${{ inputs.server_coverage_threshold }}
+          INCLUDE: ${{ inputs.server_coverage_include }}
+          EXCLUDE: ${{ inputs.server_coverage_exclude }}
+        run: |
+          excludes=()
+          IFS=',' read -ra patterns <<< "$EXCLUDE"
+          for pattern in "${patterns[@]}"; do excludes+=(--exclude "$pattern"); done
+          npx --yes c8@10 --all --include "$INCLUDE" "${excludes[@]}" \
+            --reporter text --reporter json-summary --report-dir coverage \
+            --check-coverage --lines "$THRESHOLD" --branches "$THRESHOLD" \
+            --functions "$THRESHOLD" --statements "$THRESHOLD" \
+            npm test
+
+      # Writes the totals to the job summary, so the numbers are on the run
+      # page without opening the logs.
+      - name: Server coverage summary
+        if: always() && inputs.server_coverage_threshold != ''
+        working-directory: ${{ inputs.server_directory }}
+        env:
+          THRESHOLD: ${{ inputs.server_coverage_threshold }}
+          LABEL: Server
+        run: |
+          cat > "$RUNNER_TEMP/coverage-summary.js" <<'JS'
+            const fs = require('fs');
+            const file = process.argv[2];
+            const label = process.env.LABEL, min = Number(process.env.THRESHOLD);
+            let out;
+            if (!fs.existsSync(file)) {
+              out = `### ${label} coverage\n\nNo coverage report: the tests did not finish.\n`;
+            } else {
+              const t = JSON.parse(fs.readFileSync(file, 'utf8')).total;
+              const rows = ['lines', 'branches', 'functions', 'statements'].map((k) =>
+                `| ${k} | ${t[k].pct}% | ${t[k].pct >= min ? 'ok' : 'below ' + min + '%'} |`);
+              out = `### ${label} coverage (minimum ${min}%)\n\n| | coverage | |\n|---|---|---|\n${rows.join('\n')}\n`;
+            }
+            fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, out + '\n');
+            console.log(out);
+          JS
+          node "$RUNNER_TEMP/coverage-summary.js" coverage/coverage-summary.json
