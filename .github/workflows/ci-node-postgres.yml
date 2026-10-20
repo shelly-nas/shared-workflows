@@ -91,25 +91,6 @@ on:
         default: >-
           node -e "require('./dist/context/migrations').runMigrations().then(() => process.exit(0)).catch((e) => { console.error(e); process.exit(1); })"
 
-# Writes the totals of an istanbul json-summary to the job summary, so the
-# numbers are visible on the run page without opening the logs.
-env:
-  COVERAGE_SUMMARY_JS: |
-    const fs = require('fs');
-    const file = process.argv[1];
-    const label = process.env.LABEL, min = Number(process.env.THRESHOLD);
-    let out;
-    if (!fs.existsSync(file)) {
-      out = `### ${label} coverage\n\nNo coverage report: the tests did not finish.\n`;
-    } else {
-      const t = JSON.parse(fs.readFileSync(file, 'utf8')).total;
-      const rows = ['lines', 'branches', 'functions', 'statements'].map((k) =>
-        `| ${k} | ${t[k].pct}% | ${t[k].pct >= min ? 'ok' : 'below ' + min + '%'} |`);
-      out = `### ${label} coverage (minimum ${min}%)\n\n| | coverage | |\n|---|---|---|\n${rows.join('\n')}\n`;
-    }
-    fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, out + '\n');
-    console.log(out);
-
 jobs:
   typecheck:
     name: Typecheck ${{ matrix.project }}
@@ -168,13 +149,32 @@ jobs:
             --coverage.thresholds.lines="$THRESHOLD" --coverage.thresholds.branches="$THRESHOLD" \
             --coverage.thresholds.functions="$THRESHOLD" --coverage.thresholds.statements="$THRESHOLD"
 
+      # Writes the totals to the job summary, so the numbers are on the run
+      # page without opening the logs.
       - name: Client coverage summary
         if: always() && inputs.client_coverage_threshold != ''
         working-directory: ${{ inputs.client_directory }}
         env:
           THRESHOLD: ${{ inputs.client_coverage_threshold }}
           LABEL: Client
-        run: node -e "$COVERAGE_SUMMARY_JS" coverage/coverage-summary.json
+        run: |
+          cat > "$RUNNER_TEMP/coverage-summary.js" <<'JS'
+            const fs = require('fs');
+            const file = process.argv[2];
+            const label = process.env.LABEL, min = Number(process.env.THRESHOLD);
+            let out;
+            if (!fs.existsSync(file)) {
+              out = `### ${label} coverage\n\nNo coverage report: the tests did not finish.\n`;
+            } else {
+              const t = JSON.parse(fs.readFileSync(file, 'utf8')).total;
+              const rows = ['lines', 'branches', 'functions', 'statements'].map((k) =>
+                `| ${k} | ${t[k].pct}% | ${t[k].pct >= min ? 'ok' : 'below ' + min + '%'} |`);
+              out = `### ${label} coverage (minimum ${min}%)\n\n| | coverage | |\n|---|---|---|\n${rows.join('\n')}\n`;
+            }
+            fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, out + '\n');
+            console.log(out);
+          JS
+          node "$RUNNER_TEMP/coverage-summary.js" coverage/coverage-summary.json
 
   server-tests:
     name: Schema and server tests
@@ -308,10 +308,29 @@ jobs:
             --functions "$THRESHOLD" --statements "$THRESHOLD" \
             npm test
 
+      # Writes the totals to the job summary, so the numbers are on the run
+      # page without opening the logs.
       - name: Server coverage summary
         if: always() && inputs.server_coverage_threshold != ''
         working-directory: ${{ inputs.server_directory }}
         env:
           THRESHOLD: ${{ inputs.server_coverage_threshold }}
           LABEL: Server
-        run: node -e "$COVERAGE_SUMMARY_JS" coverage/coverage-summary.json
+        run: |
+          cat > "$RUNNER_TEMP/coverage-summary.js" <<'JS'
+            const fs = require('fs');
+            const file = process.argv[2];
+            const label = process.env.LABEL, min = Number(process.env.THRESHOLD);
+            let out;
+            if (!fs.existsSync(file)) {
+              out = `### ${label} coverage\n\nNo coverage report: the tests did not finish.\n`;
+            } else {
+              const t = JSON.parse(fs.readFileSync(file, 'utf8')).total;
+              const rows = ['lines', 'branches', 'functions', 'statements'].map((k) =>
+                `| ${k} | ${t[k].pct}% | ${t[k].pct >= min ? 'ok' : 'below ' + min + '%'} |`);
+              out = `### ${label} coverage (minimum ${min}%)\n\n| | coverage | |\n|---|---|---|\n${rows.join('\n')}\n`;
+            }
+            fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, out + '\n');
+            console.log(out);
+          JS
+          node "$RUNNER_TEMP/coverage-summary.js" coverage/coverage-summary.json
