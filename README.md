@@ -89,7 +89,8 @@ log out.
 | `compose_file` | no | `docker-compose.prod.yaml` | Compose file in the repo; copied to the deploy directory as `docker-compose.yaml`. Note the `.yaml` default - pass it explicitly if yours is `.yml` |
 | `image_tag` | no | `latest` | Written to `.env` as `IMAGE_TAG`. Pass the commit (or a version), not `latest` |
 | `runner` | no | `shelly` | Runner label |
-| `health_check_delay` | no | `15` | Seconds to wait after `up` before checking the containers |
+| `health_check_delay` | no | `15` | Seconds every container must stay running, healthy and without a restart before the deploy counts as done |
+| `health_check_timeout` | no | `180` | Seconds to wait at most for containers with a `healthcheck` to report healthy |
 | `prune_images` | no | `true` | Run the [cleanup](#cleanup) after the deploy |
 | `prune_age` | no | *(empty)* | Only prune images older than this, e.g. `168h`. Empty prunes every unused image |
 | `acc_directory` | no | *(empty)* | The app's acc directory (`/volume1/docker/<app>-acc`). When set, acc is torn down once its change is in production; see below. The fallback for [`teardown-acceptance.yml`](#teardown-acceptanceyml) |
@@ -108,8 +109,11 @@ Steps:
 3. Create each of `persistent_volumes` that does not exist yet.
 4. Log in, `docker compose down --remove-orphans`, `docker compose pull`,
    `docker compose up -d --remove-orphans`.
-5. Wait `health_check_delay` seconds, then fail if any service is not running
-   (with the last 100 log lines of each service on failure).
+5. Check every container until it has been running, healthy (when it has a
+   `healthcheck`) and without a restart for `health_check_delay` seconds in a
+   row. Fail right away on a restart, an exited or an unhealthy container, or
+   after `health_check_timeout` seconds when a healthcheck never reports
+   healthy (with the last 100 log lines of each service on failure).
 6. Log out and **delete the `.env`**.
 7. Run the [cleanup](#cleanup), also when the deploy failed.
 8. With `acc_directory` set: tear down acc if its change is now in production.
@@ -144,9 +148,14 @@ Things to know:
   on the earlier commit.
 - **The stack is stopped before the new images are pulled**, so there is a short
   outage on every deploy, longer if the pull is slow.
-- **The check means "running", not "healthy".** Give services a `healthcheck` in
-  the compose file and use `depends_on: condition: service_healthy` so a broken
-  start shows up as a restarting container.
+- **A restart fails the deploy.** A crash-looping container is "running" for a
+  moment between restarts, so the check also looks at the restart count: any
+  restart after `up` fails the deploy. Let a server wait for its database with
+  `depends_on: condition: service_healthy` instead of crashing until the
+  database is up, and give services a `healthcheck` so "healthy" means more
+  than "the process started". A database healthcheck should test over TCP
+  (`pg_isready -h 127.0.0.1`): during its init scripts Postgres answers on the
+  socket only.
 - Only the compose file and the `.env` reach the NAS. Anything else a container
   needs (schema, config) must be baked into its image.
 
@@ -166,7 +175,8 @@ Production is not touched.
 | `db_service` | no | `db` | Database service name in the acc compose file |
 | `demo_seed_file` | no | `database/seed-demo.sql` | SQL loaded after the schema; empty to skip |
 | `runner` | no | `shelly` | Runner label |
-| `health_check_delay` | no | `15` | Seconds to wait after `up` before checking the containers |
+| `health_check_delay` | no | `15` | Seconds every container must stay running, healthy and without a restart before the deploy counts as done |
+| `health_check_timeout` | no | `180` | Seconds to wait at most for containers with a `healthcheck` to report healthy |
 | `prune_images` | no | `true` | Run the [cleanup](#cleanup) after the deploy |
 | `prune_age` | no | *(empty)* | Only prune images older than this. Empty prunes every unused image |
 
@@ -181,7 +191,7 @@ Steps:
 4. Wait until Postgres answers over TCP (it only does once the init scripts are
    done), then load `demo_seed_file` from the checked-out branch.
 5. Start the rest of the stack; the server applies its pending migrations.
-6. Check the containers like `deploy-production.yml`, log out and delete the `.env`.
+6. Check the containers like `deploy-production.yml` (running, healthy, no restart), log out and delete the `.env`.
 7. Run the [cleanup](#cleanup), which removes the previous `acc-<commit>` images.
 
 Because the database is rebuilt on every deploy, data entered on acc does not

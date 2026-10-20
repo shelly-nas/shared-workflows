@@ -40,10 +40,15 @@ on:
         type: string
         default: 'shelly'
       health_check_delay:
-        description: 'Seconds to wait before health check'
+        description: 'Seconds every container must stay running, healthy and without a restart before the deploy counts as done'
         required: false
         type: number
         default: 15
+      health_check_timeout:
+        description: 'Seconds to wait at most for containers with a healthcheck to report healthy'
+        required: false
+        type: number
+        default: 180
       prune_images:
         description: 'Remove unused images, dangling anonymous volumes and build cache after the run'
         required: false
@@ -152,29 +157,58 @@ jobs:
         working-directory: ${{ env.DEPLOY_DIR }}
         run: docker compose --env-file .env up -d --remove-orphans
 
-      - name: Wait for services to be healthy
-        run: |
-          echo "Waiting for services to start..."
-          sleep ${{ inputs.health_check_delay }}
-
-      - name: Check container status
+      - name: Verify services are healthy
         working-directory: ${{ env.DEPLOY_DIR }}
-        run: docker compose ps
-
-      - name: Verify services are running
-        working-directory: ${{ env.DEPLOY_DIR }}
+        env:
+          STABLE: ${{ inputs.health_check_delay }}
+          TIMEOUT: ${{ inputs.health_check_timeout }}
+        shell: bash
         run: |
-          # Check if all containers are running
-          RUNNING=$(docker compose ps --services --filter "status=running" | wc -l)
-          TOTAL=$(docker compose ps --services | wc -l)
-          
-          echo "Running containers: $RUNNING/$TOTAL"
-          
-          if [ "$RUNNING" -ne "$TOTAL" ]; then
-            echo "Not all services are running!"
-            docker compose ps
-            exit 1
-          fi
+          # Every container must be running, never restarted, and healthy when
+          # it has a healthcheck, for STABLE seconds in a row. A crash-looping
+          # container is "running" for a moment between restarts, so counting
+          # running containers once is not enough. Fails right away on a
+          # restart, an exited container or an unhealthy one; gives up after
+          # TIMEOUT seconds when a healthcheck never reports healthy.
+          ids=$(docker compose ps -aq)
+          if [ -z "$ids" ]; then echo "No containers in this stack!"; exit 1; fi
+          deadline=$((SECONDS + TIMEOUT))
+          good_since=""
+          while :; do
+            bad=""; waiting=""
+            for id in $ids; do
+              read -r name status health restarts < <(docker inspect --format \
+                '{{.Name}} {{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}} {{.RestartCount}}' "$id")
+              name=${name#/}
+              if [ "$status" != "running" ] || [ "$restarts" -gt 0 ] || [ "$health" = "unhealthy" ]; then
+                bad="$bad $name($status, health $health, $restarts restarts)"
+              elif [ "$health" = "starting" ]; then
+                waiting="$waiting $name"
+              fi
+            done
+            if [ -n "$bad" ]; then
+              echo "::error::Not healthy:$bad"
+              docker compose ps -a
+              exit 1
+            fi
+            if [ -n "$waiting" ]; then
+              good_since=""
+              if [ "$SECONDS" -ge "$deadline" ]; then
+                echo "::error::Health check still starting after ${TIMEOUT}s:$waiting"
+                docker compose ps -a
+                exit 1
+              fi
+              echo "Waiting for health checks:$waiting"
+            else
+              good_since=${good_since:-$SECONDS}
+              if [ $((SECONDS - good_since)) -ge "$STABLE" ]; then
+                echo "All $(echo $ids | wc -w) containers running and healthy for ${STABLE}s, no restarts."
+                docker compose ps
+                break
+              fi
+            fi
+            sleep 3
+          done
 
       - name: Show logs on failure
         if: failure()
