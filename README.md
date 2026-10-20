@@ -11,7 +11,7 @@ runners.
 | [`deploy-production.yml`](.github/workflows/deploy-production.yml) | Copies a compose file and a `.env` to a directory on the NAS, pulls the images and starts the stack |
 | [`deploy-acceptance.yml`](.github/workflows/deploy-acceptance.yml) | Deploys a branch to the app's acceptance stack, with a fresh database of schema, seed and demo data |
 | [`teardown-acceptance.yml`](.github/workflows/teardown-acceptance.yml) | Removes the acceptance stack when the pull request on it is merged or closed |
-| [`ci-node-postgres.yml`](.github/workflows/ci-node-postgres.yml) | CI for an app with a Node server: typecheck, tests, and the schema, seed and migration checks against Postgres |
+| [`ci-node-postgres.yml`](.github/workflows/ci-node-postgres.yml) | CI for an app with a Node server: typecheck, tests with an optional coverage minimum, and the schema, seed and migration checks against Postgres |
 
 Every deploy, acc and production, ends by removing what the NAS no longer
 uses: images no container references, dangling anonymous volumes and dangling
@@ -290,11 +290,37 @@ jobs:
 | `seed_check_table` | no | *(empty)* | Table whose row count must not change on the second seed. Empty only checks that it does not fail |
 | `migrations_directory` | no | `server/migrations` | Where the `NNN_*.sql` migrations live; checked for duplicate numbers |
 | `migrate_command` | no | `node -e "require('./dist/context/migrations').runMigrations()…"` | Run twice in `server_directory` after the build; the second run must be a no-op. Empty to skip |
+| `client_coverage_threshold` | no | *(empty)* | Minimum client coverage in %, for lines, branches, functions and statements. Empty: no measuring. `0`: measure and report only |
+| `server_coverage_threshold` | no | *(empty)* | The same for the server |
+| `server_coverage_include` | no | `dist/**/*.js` | Built server code that coverage counts, relative to `server_directory` |
+| `server_coverage_exclude` | no | `dist/**/*.test.js,dist/**/__tests__/**` | Comma-separated globs left out of server coverage |
 
 Jobs: `Typecheck <dir>` per directory, `Client unit tests`, and `Schema and
 server tests` (build, duplicate migration numbers, schema and seed, seed again,
 migrations twice, `npm test`). The server tests get `DB_HOST`, `DB_PORT`,
 `DB_USER`, `DB_PASSWORD`, `DB_NAME` and `DATABASE_URL` in their environment.
+
+### Coverage
+
+The standard is at least 80% coverage (the `testen` skill in shelly-fundamentals).
+An app below that sets the threshold to its current coverage, rounded down, and
+raises it with every pull request that adds tests:
+
+```yaml
+    with:
+      client_coverage_threshold: '12'
+      server_coverage_threshold: '45'
+```
+
+- **Client:** `npm test -- --coverage...` with Vitest's v8 coverage over `src/**`, so
+  untested files count as 0%. `@vitest/coverage-v8` is installed at the version of the
+  app's `vitest` when the app does not have it.
+- **Server:** [c8](https://github.com/bcoe/c8) around `npm test`, over the built code
+  (`dist/`), mapped back to the TypeScript sources when the build emits source maps
+  (`"sourceMap": true`). `npm test` must run the tests on the built code
+  (`tsc && node --test "dist/**/*.test.js"`): coverage through `tsx` reports untested
+  lines as covered.
+- Both write their totals to the job summary of the run.
 
 A Python backend is not covered yet; keep the CI from the `release-deploy`
 skill in the app for now.
